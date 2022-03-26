@@ -246,6 +246,21 @@ function staticDir(dir) {
 	})
 }
 
+/**
+ * Sanitizes the provided HTML by escaping HTML entities
+ * @param {string} html The HTML to sanitize
+ * @returns {string} The sanitized HTML
+ * @since 1.0.0
+ */
+function $(html) {
+	return (html || '').toString()
+		.replace(/&/g, '&amp;')
+		.replace(/</g, '&lt;')
+		.replace(/>/g, '&gt;')
+		.replace(/"/g, '&quot;')
+		.replace(/'/g, '&#39;')
+}
+
 /* Main program */
 // Check for index.js
 const indexPath = pathUtil.join(projPath, 'index.js')
@@ -280,7 +295,8 @@ require.cache[ssgPath].exports = {
 	copy,
 	staticDir,
 	fromTemplate,
-	fromScript
+	fromScript,
+	$
 }
 rm(ssgPath)
 
