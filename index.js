@@ -176,22 +176,24 @@ function getContext(key) {
  * Creates a function from a template
  * @param {string} template The template to process
  * @param {Context} context Additional context data to make available to the template
+ * @param {string} filename The name of the template (for debug purposes)
  * @returns {() => string} The template function
  * @since 1.0.0
  */
-function createTemplateFunction(template, context = {}) {
-	return vm.runInNewContext('(() => `'+template+'`)', vm.createContext({ ...CONTEXT, ...COMPONENTS, $, ...context }))
+function createTemplateFunction(template, context = {}, filename = 'Anonymous Template') {
+	return vm.runInNewContext('(() => `'+template+'`)', vm.createContext({ ...CONTEXT, ...COMPONENTS, $, ...context }), { filename })
 }
 
 /**
  * Processes a template and returns its output
  * @param {string} template The template to process
  * @param {Context} context Additional context data to make available to the template
+ * @param {string} filename The name of the template (for debug purposes)
  * @returns {string} The template output
  * @since 1.0.0
  */
-function template(template, context = {}) {
-	return createTemplateFunction(template, context)()
+function template(template, context = {}, filename = 'Anonymous Template') {
+	return createTemplateFunction(template, context, filename)()
 }
 
 function page(path, content) {
@@ -214,7 +216,7 @@ function page(path, content) {
  * @since 1.0.0
  */
 function fromTemplate(path, context = {}) {
-	return template(readFile(path).toString('utf8'), context)
+	return template(readFile(path).toString('utf8'), context, pathUtil.basename(path))
 }
 
 /**
