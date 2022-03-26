@@ -117,6 +117,21 @@ function copyRecursive(source, target) {
 	}
 }
 
+/**
+ * Sanitizes the provided HTML by escaping HTML entities
+ * @param {string} html The HTML to sanitize
+ * @returns {string} The sanitized HTML
+ * @since 1.0.0
+ */
+function $(html) {
+	return (html || '').toString()
+		.replace(/&/g, '&amp;')
+		.replace(/</g, '&lt;')
+		.replace(/>/g, '&gt;')
+		.replace(/"/g, '&quot;')
+		.replace(/'/g, '&#39;')
+}
+
 /* Main functions */
 /**
  * Registers a new component
@@ -166,7 +181,7 @@ function getContext(key) {
  * @since 1.0.0
  */
 function createTemplateFunction(template, context = {}, components = []) {
-	return vm.runInNewContext('(() => `'+template+'`)', vm.createContext({ ...CONTEXT, ...COMPONENTS, ...context }))
+	return vm.runInNewContext('(() => `'+template+'`)', vm.createContext({ ...CONTEXT, ...COMPONENTS, ...context, $ }))
 }
 
 /**
@@ -246,21 +261,6 @@ function staticDir(dir) {
 	readdir(path).forEach(file => {
 		copyRecursive(pathUtil.join(path, file), pathUtil.join(outPath, file))
 	})
-}
-
-/**
- * Sanitizes the provided HTML by escaping HTML entities
- * @param {string} html The HTML to sanitize
- * @returns {string} The sanitized HTML
- * @since 1.0.0
- */
-function $(html) {
-	return (html || '').toString()
-		.replace(/&/g, '&amp;')
-		.replace(/</g, '&lt;')
-		.replace(/>/g, '&gt;')
-		.replace(/"/g, '&quot;')
-		.replace(/'/g, '&#39;')
 }
 
 /**
