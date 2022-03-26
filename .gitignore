@@ -134,8 +134,5 @@ dist
 /project
 /project_out
 
-# Auto-reload script
-/autoreload.sh
-
 # WebStorm
 /.idea
