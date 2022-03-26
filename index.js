@@ -263,6 +263,24 @@ function $(html) {
 		.replace(/'/g, '&#39;')
 }
 
+/**
+ * Returns the real path on disk of the specified project path
+ * @param {string} path The relative project path
+ * @return {string} The real path on disk
+ */
+function toProjectPath(path) {
+	return pathUtil.join(projPath, path)
+}
+
+/**
+ * Returns the real path on disk of the specified output path
+ * @param {string} path The relative output path
+ * @return {string} The real path on disk
+ */
+function toOutputPath(path) {
+	return pathUtil.join(outPath, path)
+}
+
 /* Main program */
 // Check for index.js
 const indexPath = pathUtil.join(projPath, 'index.js')
@@ -298,7 +316,9 @@ require.cache[ssgPath].exports = {
 	staticDir,
 	fromTemplate,
 	fromScript,
-	$
+	$,
+	toProjectPath,
+	toOutputPath
 }
 rm(ssgPath)
 
