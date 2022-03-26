@@ -209,11 +209,12 @@ function page(path, content) {
 /**
  * Renders a template file
  * @param {string} path The path to the template file
+ * @param {SsgContext} context Additional context to provide to the template
  * @return {string} The rendered template file
  * @since 1.0.0
  */
-function fromTemplate(path) {
-	return template(readFile(path).toString('utf8'))
+function fromTemplate(path, context = {}) {
+	return template(readFile(path).toString('utf8'), context)
 }
 
 /**
