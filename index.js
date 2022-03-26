@@ -1,3 +1,5 @@
+#!/usr/bin/node
+
 /* Typedefs */
 /**
  * @typedef SsgComponent
