@@ -176,24 +176,22 @@ function getContext(key) {
  * Creates a function from a template
  * @param {string} template The template to process
  * @param {Context} context Additional context data to make available to the template
- * @param {SsgComponent[]} components Additional components to make available to the template
  * @returns {() => string} The template function
  * @since 1.0.0
  */
-function createTemplateFunction(template, context = {}, components = []) {
-	return vm.runInNewContext('(() => `'+template+'`)', vm.createContext({ ...CONTEXT, ...COMPONENTS, ...context, $ }))
+function createTemplateFunction(template, context = {}) {
+	return vm.runInNewContext('(() => `'+template+'`)', vm.createContext({ ...CONTEXT, ...COMPONENTS, $, ...context }))
 }
 
 /**
  * Processes a template and returns its output
  * @param {string} template The template to process
  * @param {Context} context Additional context data to make available to the template
- * @param {SsgComponent[]} components Additional components to make available to the template
  * @returns {string} The template output
  * @since 1.0.0
  */
-function template(template, context = {}, components = []) {
-	return createTemplateFunction(template, context, components)()
+function template(template, context = {}) {
+	return createTemplateFunction(template, context)()
 }
 
 function page(path, content) {
