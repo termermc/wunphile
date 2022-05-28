@@ -175,7 +175,7 @@ function getContext(key) {
 /**
  * Creates a function from a template
  * @param {string} template The template to process
- * @param {Context} context Additional context data to make available to the template
+ * @param {SsgContext} context Additional context data to make available to the template
  * @param {string} filename The name of the template (for debug purposes)
  * @returns {() => string} The template function
  * @since 1.0.0
@@ -187,7 +187,7 @@ function createTemplateFunction(template, context = {}, filename = 'Anonymous Te
 /**
  * Processes a template and returns its output
  * @param {string} template The template to process
- * @param {Context} context Additional context data to make available to the template
+ * @param {SsgContext} context Additional context data to make available to the template
  * @param {string} filename The name of the template (for debug purposes)
  * @returns {string} The template output
  * @since 1.0.0
