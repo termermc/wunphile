@@ -49,9 +49,9 @@ await ssg.cli()
 ```
 
 The above code will look very familiar to anyone who has used Express or a similar imperative-style web framework.
-Paths are mapped to functions that return HTML, static directories are mount, etc.
+Paths are mapped to functions that return HTML, static directories are mounted, etc.
 
-Unlike backend frameworks, however, this generates all the HTML and files at build time, and writes them to an output directory,
+Unlike backend frameworks, however, Wunphile generates all the HTML and files at build time. It writes everything to an output directory,
 ready to be served by a traditional webserver such as Nginx or Caddy.
 
 Its goal is to live up to the following qualities:
