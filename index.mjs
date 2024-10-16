@@ -964,20 +964,18 @@ export class RenderFragment {
  * const greeting = html`<h1>Hello, ${name}!</h1>`
  * ```
  *
- * @param {string|string[]} strs The string(s) to interpolate
+ * @param {string|TemplateStringsArray} strs The string(s) to interpolate
  * @param {any[]} vals The values to interpolate
  * @returns {RenderFragments} The resulting render fragments
  */
 export function html(strs, ...vals) {
-    if (typeof strs === 'string') {
-        strs = [strs]
-    }
-
     /** @type {RenderFragments} */
     const res = []
 
-    for (let i = 0; i < strs.length; i++) {
-        const str = strs[i]
+    const strsProc = typeof strs === 'string' ? [strs] : strs
+
+    for (let i = 0; i < strsProc.length; i++) {
+        const str = strsProc[i]
 
         if (str !== '') {
             res.push(new RenderFragment(RenderFragmentType.HTML, str))
