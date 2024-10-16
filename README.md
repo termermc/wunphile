@@ -145,3 +145,16 @@ See the `--help` option for more information about the CLI and environment varia
 ## Example Project
 
 You can look at an example project that implements a simple blog site [here](https://git.termer.net/termer/wunphile-template).
+
+## IDE Integration
+
+Wunphile uses ES6 template literals for composing HTML.
+Different IDEs need different configuration to provide syntax highlighting and intellisense for HTML inside template literals.
+
+### VS Code
+
+Install the [es6-string-html](https://marketplace.visualstudio.com/items?itemName=Tobermory.es6-string-html) extension.
+
+### JetBrains IDEs
+
+Recent versions of JetBrains IDEs should support syntax highlighting and intellisense for HTML inside template literals out of the box.
