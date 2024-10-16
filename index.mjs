@@ -108,7 +108,7 @@ import * as pathUtil from 'node:path'
  * import { Wunphile } from 'wunphile'
  * import { IndexPage } from './components/Greeting.js'
  *
- * const ssg = new SimpleJsSsg(import.meta.url)
+ * const ssg = new Wunphile(import.meta.url)
  *
  * ssg.page('/index.html', IndexPage)
  *
@@ -167,7 +167,7 @@ export class Wunphile {
      * import { Wunphile } from 'wunphile'
      * import { IndexPage } from './components/Greeting.js'
      *
-     * const ssg = new SimpleJsSsg(import.meta.url)
+     * const ssg = new Wunphile(import.meta.url)
      *
      * ssg.page('/index.html', IndexPage)
      *
