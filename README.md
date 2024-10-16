@@ -22,7 +22,7 @@ const ssg = new Wunphile(import.meta.url)
 // We use the `page` to register components for pages.
 ssg.page('/index.html', IndexPage)
 
-// Components area simply functions that return HTML using the "html" template function.
+// Components are simply functions that return HTML using the "html" template function.
 // Similarly to React, strings interpolated into the template function will be sanitized.
 // The "html" template function takes in a template string and returns React-style RenderFragments.
 // No JSX needed!
