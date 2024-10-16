@@ -127,4 +127,4 @@ See the `--help` option for more information about the CLI and environment varia
 
 ## Example Project
 
-You can look at an example project that implements a simple blog site [here](https://git.termer.net/termer/wunphile-example).
+You can look at an example project that implements a simple blog site [here](https://git.termer.net/termer/wunphile-template).
