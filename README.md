@@ -92,23 +92,17 @@ from using it as a basis for a framework that does provide such features.
 
 <details>
 <summary>Using NPM</summary>
-<code lang="shell">
-npm install --save-dev wunphile
-</code>
+<code lang="shell">npm install --save-dev wunphile</code>
 </details>
 
 <details>
 <summary>Using PNPM</summary>
-<code lang="shell">
-pnpm add --save-dev wunphile
-</code>
+<code lang="shell">pnpm add --save-dev wunphile</code>
 </details>
 
 <details>
 <summary>Using Yarn</summary>
-<code lang="shell">
-yarn add --dev wunphile
-</code>
+<code lang="shell">yarn add --dev wunphile</code>
 </details>
 
 <details>
