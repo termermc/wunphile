@@ -124,3 +124,7 @@ If run with no arguments, it will build the site.
 If run with `--dev` or `-d`, it will start a development server.
 
 See the `--help` option for more information about the CLI and environment variables that can be used to configure it.
+
+## Example Project
+
+You can look at an example project that implements a simple blog site [here](https://git.termer.net/termer/wunphile-example).
