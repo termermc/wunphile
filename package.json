@@ -1,6 +1,6 @@
 {
     "name": "wunphile",
-    "version": "1.0.0-b",
+    "version": "1.0.1",
     "description": "Simple, imperative JavaScript-based static site generator",
     "main": "dist/index.mjs",
     "type": "module",

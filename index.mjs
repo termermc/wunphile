@@ -292,6 +292,29 @@ export class Wunphile {
     }
 
     /**
+     * Registers a redirect from one path to another.
+     * The redirect is done with an HTML file using a meta refresh tag and fallback JavaScript.
+     * @param {string} path The path to redirect from
+     * @param {string} url The URL/path to redirect to
+     */
+    redirect(path, url) {
+        this.page(path, () => html`
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <title>Redirecting to ${url}...</title>
+            </head>
+            <body>
+                Redirecting to <a href="${url}">${url}</a>... (click link if nothing happens)
+                <meta http-equiv="refresh" content="0; url=${url}">
+                <script>location.assign(${html(JSON.stringify(url))})</script>
+            </body>
+            </html>
+        `)
+    }
+
+    /**
      * Registers a component to be used as the not found page.
      * The not found page is configured via the `SSG_NOT_FOUND_PATH` environment variable, and defaults to `/404.html`.
      * @param {Component<void, void>} component The component to use for the not found page
@@ -987,6 +1010,27 @@ export function html(strs, ...vals) {
     }
 
     return res
+}
+
+/**
+ * Generates a plain text render fragment from a raw string.
+ * The string's escape sequences will not be processed.
+ *
+ * @example
+ * ```ts
+ * const greeting = text`Hello, ${name}!`
+ * ```
+ *
+ * @param {string|TemplateStringsArray} strs The string(s) to interpolate
+ * @param {any[]} vals The values to interpolate
+ * @returns {RenderFragments} The resulting plain text render fragment
+ */
+export function text(strs, ...vals) {
+    if (typeof strs === 'string') {
+        return RenderFragment.from(strs)
+    }
+
+    return RenderFragment.from(String.raw(strs, ...vals))
 }
 
 /**
