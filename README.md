@@ -88,6 +88,23 @@ It is not a framework for building web apps, and does not provide any dynamic ro
 More complicated frontend integration is out of the scope of this library, but there is nothing stopping developers
 from using it as a basis for a framework that does provide such features.
 
+## Development Mode and Hot Reloading
+
+When the `cli` method is called with the `--dev` or `-d` option, a development server will be started.
+
+The development server will watch the project root directory for changes and hot reload the site when changes are detected.
+
+While in development mode, the site will not be built and the filesystem will not be touched.
+Instead, the site will be served from an embedded HTTP server.
+
+Whenever the site is hot reloaded, pages open in the browser will be automatically reloaded through a small script injected into pages in development mode.
+This can be disabled by setting the `SSG_DEV_NO_INJECT` environment variable to `1`.
+
+To disable hot reloading entirely, set the `SSG_DEV_NO_HOT_RELOAD` environment variable to `1`.
+
+Note that whenever the site is hot reloaded, the main module will be re-run in a worker thread.
+This means that the main module should not contain any extra code besides what is necessary to build the site.
+
 ## Installation
 
 <details>
