@@ -1126,7 +1126,7 @@ const htmlEntityReplacements = {
     '"': '&quot;',
     "'": '&#x27;',
 }
-const htmlEntityRegex = /[&<>"'/]/g
+const htmlEntityRegex = /[&<>"']/g
 /**
  * @param {string} match
  * @returns {string}
