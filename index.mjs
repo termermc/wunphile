@@ -1125,7 +1125,6 @@ const htmlEntityReplacements = {
     '>': '&gt;',
     '"': '&quot;',
     "'": '&#x27;',
-    '/': '&#x2F;',
 }
 const htmlEntityRegex = /[&<>"'/]/g
 /**
