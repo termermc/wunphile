@@ -1,6 +1,6 @@
 {
     "name": "wunphile",
-    "version": "1.0.2-b",
+    "version": "1.0.3",
     "description": "Simple, imperative JavaScript-based static site generator",
     "main": "dist/index.mjs",
     "type": "module",
@@ -32,11 +32,9 @@
     "devDependencies": {
         "@types/mime-db": "^1.43.5",
         "@types/node": "^22.7.5",
+        "chokidar": "^4.0.3",
+        "mime-db": "^1.53.0",
         "prettier": "^3.3.3",
         "typescript": "^5.6.3"
-    },
-    "dependencies": {
-        "chokidar": "^4.0.1",
-        "mime-db": "^1.53.0"
     }
 }
