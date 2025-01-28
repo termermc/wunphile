@@ -97,8 +97,288 @@ export const DEV_NO_INJECT_ENV_VAR = 'SSG_DEV_NO_INJECT'
  * @template TChildren The component's children type
  */
 
+/**
+ * @typedef {(element?: HTMLElement) => void} Behavior
+ * A behavior is a function that will run on the browser.
+ * Its first argument is the containing element of the component the behavior is attached to, if any.
+ */
+
+/**
+ * @typedef BehaviorModule
+ * A behavior module is a module that will run on the browser.
+ * It can be used in tandem with components to add interactivity.
+ * For example, an image component could be augmented with a behavior that allows it to be enlarged.
+ *
+ * Behavior modules can also include common functions that other modules can use.
+ *
+ * The benefit of using behavior modules is that your JavaScript engine's TypeScript support can be used to automatically convert behaviors to plain JS for the browser.
+ *
+ * Important: top-level code (other than imports), as well as extra properties on the module, will not be included in the browser bundle.
+ * If you need a stateful module, write a plain JS module and import it. You must not use TypeScript for such modules, as the builder will not be able to convert them to plain JS.
+ *
+ * All imports must be relative within the client directory.
+ * Additionally, all imports to behavior modules must be top-level, otherwise the builder will not be able to resolve and convert them.
+ * Do not write any import statements after your export statement! The builder is not smart enough to find them.
+ *
+ * @property {string} behaviorModuleUrl The behavior module's URL. Use `import.meta.url` for this value. Do not access this property; its runtime value is undefined behavior.
+ * @property {Behavior | undefined} [behavior] The behavior to run on the browser. Can be omitted if this module only provides functions for other modules to use.
+ * @property {Record<string, Function> | undefined} [functions] A map of functions to export. Can be omitted if this module only provides a behavior.
+ *
+ * @example
+ * ```ts
+ * import type { BehaviorModule } from 'wunphile'
+ *
+ * export default {
+ *     behaviorModuleUrl: import.meta.url,
+ *     behavior: (element: HTMLElement) => {
+ *         element.addEventListener('click', () => {
+ *             element.style.backgroundColor = 'red'
+ *         })
+ *     },
+ *     functions: {
+ *         getRandomNumber: () => Math.random(),
+ *     },
+ * } satisfies BehaviorModule
+ * ```
+ */
+
+/**
+ * @typedef {'file' | 'inline'} PageBehaviorLoaderType
+ * How to load behaviors for a page.
+ *
+ * If set to "import", the loader will be imported as a file. This will result in slightly slower loading, but is compatible with content security policies that disallow inline scripts.
+ * If set to "inline", the loader will be inlined in the page. This is the default and fastest option. If your content security policy disallows inline scripts, use "import" instead.
+ */
+
 import * as fs from 'node:fs/promises'
 import * as pathUtil from 'node:path'
+
+/**
+ * Iterator that splits a string by a separator.
+ * @param {string} str The string to split
+ * @param {string} separator The separator to split by
+ * @returns {Generator<string>} The split string iterator
+ */
+function* splitIter(str, separator) {
+    let start = 0
+    let index = 0
+    while ((index = str.indexOf(separator, start)) !== -1) {
+        yield str.slice(start, index)
+        start = index + separator.length
+    }
+    yield str.slice(start)
+}
+
+/**
+ * Regex that matches an import statement line.
+ * The path (including quotes) is captured in the named group "path".
+ * The imports (if any) are captured in the named group "imports".
+ * @type {RegExp}
+ */
+const importStmtRegex = /^\s*import\s+(?<imports>.* from)?\s*(?<path>["'].+["'])/
+
+/**
+ * Regex that matches an export statement line.
+ * @type {RegExp}
+ */
+const exportStmtRegex = /^\s*export\s+/
+
+/**
+ * Manager for client-side behaviors and modules.
+ *
+ * Serves as a crude bundler for JS modules.
+ * It works by resolving top-level imports and building a dependency graph.
+ *
+ * TypeScript modules can be used and imported, but imports to them will be converted to plain JS beforehand.
+ * The manager does not include any TypeScript support; instead, it relies on the runtime to do type stripping and simply uses the `.toString()` method to get the sources for functions.
+ */
+class ClientManager {
+    /**
+     * @typedef {{ type: 'plain' } | { type: 'behavior', rewrittenContent: string, rewrittenPath: string }} LoadedModule
+      A loaded module object either contains a plain JS module that can be copied/served verbatim, or a behavior module's rewritten source and path.
+     */
+
+    /**
+     * The path to the client directory.
+     * @type {string}
+     */
+    #rootPath
+
+    /**
+     * All currently loaded modules.
+     * @type {Map<string, LoadedModule>}
+     */
+    #loadedModules = new Map()
+
+    /**
+     * All currently loading modules.
+     * A set of promises from `import()` calls.
+     * @type {Set<Promise<any>>}
+     */
+    #loadingModules = /** @type {Set<Promise<any>>} */ (new Set())
+
+    /**
+     * Creates a new client manager.
+     * @param {string} rootPath The path to the client directory
+     */
+    constructor(rootPath) {
+        this.#rootPath = rootPath
+    }
+
+    /**
+     * Loads a module.
+     * Processes behavior modules and makes note of non-behavior modules.
+     * @param {any} mod The imported module.
+     * @param {string | null} modPath The module's path, or null if this is supposed to be a behavior module.
+     */
+    async #loadModule(mod, modPath) {
+        if (typeof mod?.default?.behaviorModuleUrl === 'string') {
+            // This is a behavior module.
+            const behaviorMod = (/** @type {{ default: BehaviorModule }} */ (mod)).default
+
+            const modUrl = behaviorMod.behaviorModuleUrl
+
+            // Load the behavior module's source from the filesystem.
+            const source = await fs.readFile(fileURLToPath(modUrl), 'utf8')
+
+            /** @type {{ path: string, importsStr: string | null }[]} */
+            const imports = []
+
+            // The first thing we need to do is find all imports and resolve them.
+            for (const importStmt of splitIter(source, '\n')) {
+                const match = importStmt.match(importStmtRegex)
+                if (match == null || match.groups == null) {
+                    if (exportStmtRegex.test(importStmt)) {
+                        // Reached export statement, stop looking for imports.
+                        break
+                    } else {
+                        continue
+                    }
+                }
+
+                const path = JSON.parse(match.groups.path)
+                const importsRaw = match.groups.imports
+                let importsStr = null
+
+                // Resolve the imports string.
+                if (importsRaw != null) {
+                    if (importsRaw.startsWith('type ')) {
+                        // Skip type imports.
+                        continue
+                    }
+
+                    if (importsRaw.startsWith('{')) {
+                        importsStr = '{ '
+
+                        const importStrs = importsRaw.slice(1, -1).split(',')
+                        if (importStrs.length !== 0) {
+                            for (let importStr of importStrs) {
+                                importStr = importStr.trim()
+                                if (importStr.startsWith('type ')) {
+                                    // Skip type imports.
+                                    continue
+                                }
+
+                                importsStr += importStr + ', '
+                            }
+
+                            importsStr = importsStr.slice(0, -2) + ' }'
+                        }
+                    } else {
+                        importsStr = importsRaw
+                    }
+                }
+
+                imports.push({ path, importsStr })
+            }
+
+            // Load all imports asynchronously.
+            for (const { path } of imports) {
+                const promise = import(path)
+                this.#loadingModules.add(promise)
+                promise
+                    .then(mod => this.#loadModule(mod, path))
+                    .finally(() => this.#loadingModules.delete(promise))
+            }
+
+            // Rewrite the source.
+            let out = ''
+            for (const { path, importsStr } of imports) {
+                if (importsStr == null) {
+                    out += `import ${path}\n`
+                } else {
+                    out += `import ${importsStr} from ${path}\n`
+                }
+            }
+            out += '\nexport default {\n    behaviorModuleUrl: import.meta.url,\n    behavior: '
+            if (behaviorMod.behavior == null) {
+                out += 'undefined,\n'
+            } else {
+                out += behaviorMod.behavior.toString() + ',\n'
+            }
+            out += '    functions: '
+            if (behaviorMod.functions == null) {
+                out += 'undefined,\n'
+            } else {
+                out += '{\n'
+                for (const [key, val] of Object.entries(behaviorMod.functions)) {
+                    out += `        ${JSON.stringify(key)}: ${val.toString()},\n`
+                }
+                out += '    },\n'
+            }
+            out += '}\n'
+
+            const behaviorModPath = fileURLToPath(behaviorMod.behaviorModuleUrl)
+
+            // TODO Check if path is within the client directory.
+
+            let modOutPath = behaviorModPath
+            if (modOutPath.endsWith('.ts')) {
+                modOutPath = modOutPath.slice(0, -3) + '.js'
+            }
+
+            // Set the loaded module.
+            this.#loadedModules.set(behaviorModPath, {
+                type: 'behavior',
+                rewrittenContent: out,
+                rewrittenPath: modOutPath,
+            })
+        } else {
+            if (modPath == null) {
+                throw new Error('Module did not export a default behavior module. Behavior modules must have a default export that adheres to the BehaviorModule type.')
+            }
+
+            // TODO Check if path is within the client directory.
+
+            this.#loadedModules.set(modPath, { type: 'plain' })
+        }
+    }
+
+    /**
+     * Loads a behavior module asynchronously.
+     * Expects that the module exports a default {@link BehaviorModule} object.
+     *
+     * @param {Promise<any>} promise The promise from the `import()` call for the behavior module
+     */
+    loadBehaviorModule(promise) {
+        this.#loadingModules.add(promise)
+
+        // Don't bother catching errors, let it crash if it fails.
+        promise.then(mod => this.#loadModule(mod, null)).finally(() => {
+            this.#loadingModules.delete(promise)
+        })
+    }
+
+    /**
+     * Waits for all modules to load.
+     * @returns {Promise<void>}
+     */
+    async waitForModules() {
+        for (const promise of this.#loadingModules) {
+            await promise
+        }
+    }
+}
 
 /**
  * The main class for the Wunphile library.
