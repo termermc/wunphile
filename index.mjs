@@ -76,6 +76,19 @@ export const DEV_NO_HOT_RELOAD_ENV_VAR = 'SSG_DEV_NO_HOT_RELOAD'
  */
 export const DEV_NO_INJECT_ENV_VAR = 'SSG_DEV_NO_INJECT'
 
+/**
+ * The prefix for client mount paths.
+ * @type {string}
+ */
+const CLIENT_MOUNT_PREFIX = '/_wfclient/'
+
+/**
+ * The prefix for client behavior hydration comments.
+ * Used by the loader to find components.
+ * @type {string}
+ */
+const CLIENT_BEHAVIOR_HYDRATE_PREFIX = 'wf-behavior:'
+
 /* Types */
 /**
  * @typedef {RenderFragment[]} RenderFragments
@@ -98,9 +111,9 @@ export const DEV_NO_INJECT_ENV_VAR = 'SSG_DEV_NO_INJECT'
  */
 
 /**
- * @typedef {(element?: HTMLElement) => void} Behavior
+ * @typedef {(element: HTMLElement) => void} Behavior
  * A behavior is a function that will run on the browser.
- * Its first argument is the containing element of the component the behavior is attached to, if any.
+ * Its first argument is the containing element of the component the behavior is attached to.
  */
 
 /**
@@ -120,8 +133,12 @@ export const DEV_NO_INJECT_ENV_VAR = 'SSG_DEV_NO_INJECT'
  * Additionally, all imports to behavior modules must be top-level, otherwise the builder will not be able to resolve and convert them.
  * Do not write any import statements after your export statement! The builder is not smart enough to find them.
  *
+ * EXTREMELY IMPORTANT: Do not import any modules with side effects.
+ * Modules are actually imported in the Node.js environment, so modules with side effects can wreck the build by modifying global state or calling browser APIs.
+ * So long as modules don't have side effects, you can safely import them. Libraries such as jQuery do not have side effects, so you can safely import them.
+ *
  * @property {string} behaviorModuleUrl The behavior module's URL. Use `import.meta.url` for this value. Do not access this property; its runtime value is undefined behavior.
- * @property {Behavior | undefined} [behavior] The behavior to run on the browser. Can be omitted if this module only provides functions for other modules to use.
+ * @property {Behavior} [behavior] The behavior to run on the browser. Can be omitted if this module only provides functions for other modules to use.
  * @property {Record<string, Function> | undefined} [functions] A map of functions to export. Can be omitted if this module only provides a behavior.
  *
  * @example
@@ -199,6 +216,11 @@ class ClientManager {
      */
 
     /**
+     * @type {Wunphile}
+     */
+    #ssg
+
+    /**
      * The path to the client directory.
      * Absolute path.
      * @type {string}
@@ -221,9 +243,11 @@ class ClientManager {
 
     /**
      * Creates a new client manager.
+     * @param {Wunphile} ssg The Wunphile instance
      * @param {string} rootPath The path to the client directory
      */
-    constructor(rootPath) {
+    constructor(ssg, rootPath) {
+        this.#ssg = ssg
         this.rootPath = pathUtil.resolve(rootPath)
     }
 
@@ -342,6 +366,13 @@ class ClientManager {
                 this.#loadingModules.add(promise)
                 promise
                     .then(mod => this.#loadModule(mod, fullImportPath))
+                    .catch(err => {
+                        if (err instanceof ReferenceError) {
+                            console.error(`Caught ReferenceError while loading module "${fullImportPath}". This is likely due to a module with side effects (such as using browser APIs). Please remove side effects from behavior modules.`)
+                        }
+
+                        throw err
+                    })
                     .finally(() => this.#loadingModules.delete(promise))
             }
 
@@ -377,12 +408,14 @@ class ClientManager {
                 modOutPath = modOutPath.slice(0, -3) + '.js'
             }
 
-            // Set the loaded module.
+            // Set the loaded module and mount it.
+            const rewrittenPath = pathUtil.relative(this.rootPath, modOutPath)
             this.loadedModules.set(pathUtil.relative(this.rootPath, behaviorModPath), {
                 type: 'behavior',
                 rewrittenContent: out,
-                rewrittenPath: pathUtil.relative(this.rootPath, modOutPath),
+                rewrittenPath,
             })
+            this.#ssg.pageRaw(CLIENT_MOUNT_PREFIX + rewrittenPath, out)
         } else {
             if (modPath == null) {
                 throw new Error('Module did not export a default behavior module. Behavior modules must have a default export that adheres to the BehaviorModule type.')
@@ -393,7 +426,9 @@ class ClientManager {
                 throw new Error(`Module path "${modPath}" is outside the client directory.`)
             }
 
-            this.loadedModules.set(pathUtil.relative(this.rootPath, modPath), { type: 'plain' })
+            const relativePath = pathUtil.relative(this.rootPath, modPath)
+            this.loadedModules.set(relativePath, { type: 'plain' })
+            this.#ssg.staticFile(CLIENT_MOUNT_PREFIX + relativePath, pathUtil.relative('./', pathUtil.join(this.rootPath, relativePath)))
         }
     }
 
@@ -428,19 +463,57 @@ class ClientManager {
     }
 
     /**
-     * @param {Wunphile} ssg
-     * @returns {Promise<void>}
+     * Generates a loader script for the specified rewritten relative paths to behavior modules.
+     * The script is a JS module that imports the scripts on the browser.
+     * The scripts can also be preloaded, but this function only generates the loader JavaScript, not the HTML script tag for it.
+     * @param {string[]} rewrittenRelativePaths The rewritten relative paths to behavior modules
+     * @returns {string} The loader script
      */
-    async testStuff(ssg) {
-        await this.waitForModules()
+    generateLoaderScript(rewrittenRelativePaths) {
+        if (rewrittenRelativePaths.length === 0) {
+            return ''
+        }
 
-        for (const [path, mod] of this.loadedModules) {
-            if (mod.type === 'behavior') {
-                ssg.page('/_wfclient/' + mod.rewrittenPath, () => html(mod.rewrittenContent))
-            } else {
-                ssg.staticFile('/_wfclient/' + path, pathUtil.relative('./', pathUtil.join(this.rootPath, path)))
+        /** @type {Map<string, string>} */
+        const varMappings = new Map()
+        let num = 0
+        for (const path of rewrittenRelativePaths) {
+            varMappings.set(`behavior${num++}`, path)
+        }
+
+        const hydrateScript = `
+function hydrate(mod, path) {
+    const comment = '${CLIENT_BEHAVIOR_HYDRATE_PREFIX}' + path
+    
+    const treeWalker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_COMMENT)
+    let node
+    while ((node = treeWalker.nextNode())) {
+        if (node.nodeType === Node.COMMENT_NODE && node.textContent === comment) {
+            // Find next element.
+            let elem
+            let nextNode = node
+            while ((nextNode = treeWalker.nextNode())) {
+                if (nextNode.nodeType === Node.ELEMENT_NODE) {
+                    elem = nextNode
+                    break
+                }
+            }
+            
+            if (elem) {
+                mod.behavior(elem)
             }
         }
+    }
+}
+        `.trim()
+
+        let out = hydrateScript + '\n'
+        for (const [varName, path] of varMappings) {
+            out += `import ${varName} from '${CLIENT_MOUNT_PREFIX}${path}'\n`
+            out += `hydrate(${varName}, '${path}')`
+        }
+
+        return out
     }
 }
 
@@ -510,14 +583,17 @@ export class Wunphile {
 
     /**
      * Preloads a behavior module.
-     * @param {Promise<any>} promise The promise from the `import()` call for the behavior module
+     * The loading is done asynchronously, similarly to using an HTML `<link rel="modulepreload">` tag.
+     * Calling this function will cause a behavior module to be included in the generated site, regardless of whether it is used in any pages.
+     *
+     * @example
+     * ```js
+     * ssg.preloadBehaviorModule(import('./client/behavior/Greeting.js'))
+     * ```
+     * @param {Promise<{ default: BehaviorModule }>} promise The promise from the `import()` call for the behavior module
      */
     preloadBehaviorModule(promise) {
         this.#clientManager.loadBehaviorModule(promise)
-    }
-
-    async testClientStuff() {
-        await this.#clientManager.testStuff(this)
     }
 
     /**
@@ -536,13 +612,14 @@ export class Wunphile {
      * ```
      *
      * @param {string} importMetaUrl The `import.meta.url` of the program main module.
+     * @param {string} [clientDir='./src/client'] The path to the client directory. Client behaviors must be within this directory.
+     *
      * Used to resolve the root path and for identifying the main module for hot reloading.
      */
-    constructor(importMetaUrl) {
+    constructor(importMetaUrl, clientDir = './src/client') {
         const mainModulePath = fileURLToPath(importMetaUrl)
-        const clientDir = pathUtil.join(pathUtil.dirname(mainModulePath), 'client')
 
-        this.#clientManager = new ClientManager(clientDir)
+        this.#clientManager = new ClientManager(this, pathUtil.join(pathUtil.dirname(mainModulePath), clientDir))
 
         if (isMainThread) {
             // Resolve paths
@@ -571,6 +648,73 @@ export class Wunphile {
             this.#outputPath = workerData.outputPath
             this.#notFoundPath = workerData.notFoundPath
         }
+    }
+
+    /**
+     * Renders the provided render fragments to HTML.
+     * Loads all behavior modules and injects loaders.
+     * @param {RenderFragments} fragments The render fragments to render
+     * @returns {Promise<string>} The rendered HTML
+     */
+    async #renderToHtmlAsync(fragments) {
+        /**
+         * Mapping of fragment indexes to their behavior module promises.
+         * @type {Map<number, Promise<{ default: BehaviorModule }>>}
+         */
+        const fragProms = new Map()
+
+        for (let i = 0; i < fragments.length; i++) {
+            const fragment = fragments[i]
+
+            if (fragment.type === RenderFragmentType.BEHAVIOR_MODULE) {
+                const prom = /** @type {Promise<{ default: BehaviorModule }>} */ (fragment.behaviorModulePromise)
+                this.#clientManager.loadBehaviorModule(prom)
+                fragProms.set(i, prom)
+            }
+        }
+
+        // Wait for all behavior modules to load before we start injecting loaders.
+        await this.#clientManager.waitForModules()
+        /**
+         * Mapping of fragment indexes to their loaded behavior modules.
+         * Values are behavior modules' rewritten paths, relative to the client root.
+         * @type {Map<number, string>}
+         */
+        const fragMods = new Map()
+        for (const [i, prom] of fragProms.entries()) {
+            const mod = (/** @type {{ default: BehaviorModule }} */ (await prom)).default
+            const relativePath = pathUtil.relative(this.#clientManager.rootPath, fileURLToPath(mod.behaviorModuleUrl))
+            const info = this.#clientManager.loadedModules.get(relativePath)
+            if (info?.type !== 'behavior') {
+                throw new Error(`Supposed behavior module "${relativePath}" is not a behavior module.`)
+            }
+
+            fragMods.set(i, info.rewrittenPath)
+        }
+
+        /** @type {string[]} */
+        const res = []
+
+        for (let i = 0; i < fragments.length; i++) {
+            const fragment = fragments[i]
+
+            if (fragment.type === RenderFragmentType.BEHAVIOR_MODULE) {
+                const relativePath = /** @type {string} */ (fragMods.get(i))
+
+                // We add a hydration comment that will be used by the loader to find components to apply behaviors to.
+                res.push(`<!--${CLIENT_BEHAVIOR_HYDRATE_PREFIX}${relativePath}-->`)
+            } else if (fragment.type === RenderFragmentType.BEHAVIOR_MODULE_LOADER) {
+                // TODO Figure out loader.
+                // We should mount a loader script and then include it as a tag if set in settings.
+                // For now, we're going to inline it to get out an MVP.
+
+                res.push(`<script type="module">\n${this.#clientManager.generateLoaderScript([...fragMods.values()])}\n</script>`)
+            } else {
+                res.push(fragment.toHtml())
+            }
+        }
+
+        return res.join('')
     }
 
     /**
@@ -639,11 +783,13 @@ export class Wunphile {
         if (isMainThread) {
             this.#pageMapping.set(path, component)
         } else {
-            // Send content to main thread.
-            parentPort.postMessage({
-                type: 'pageRaw',
-                path,
-                content: renderToHtml(component()),
+            this.#renderToHtmlAsync(component()).then(content => {
+                // Send content to main thread.
+                parentPort.postMessage({
+                    type: 'pageRaw',
+                    path,
+                    content,
+                })
             })
         }
     }
@@ -825,7 +971,7 @@ export class Wunphile {
 
             await fs.writeFile(
                 pathUtil.join(this.#outputPath, dest),
-                renderToHtml(component()),
+                await this.#renderToHtmlAsync(component()),
             )
         }
     }
@@ -975,7 +1121,7 @@ export class Wunphile {
 
                 if (pageMapping !== undefined) {
                     res.writeHead(status, { 'Content-Type': mime })
-                    res.write(renderToHtml(pageMapping()))
+                    res.write(await this.#renderToHtmlAsync(pageMapping()))
                     if (mime === 'text/html') {
                         console.log(`Serving ${path}`)
                         // Page is HTML; inject trailer.
@@ -1060,6 +1206,27 @@ export class Wunphile {
         })
     }
 
+    /**
+     * Runs the site generator CLI.
+     * The CLI can build the site or serve it on a local HTTP server for development.
+     *
+     * Call this only after all pages and static files have been registered.
+     * It should be at the end of your main module.
+     *
+     * @example
+     * ```js
+     * import { Wunphile } from 'wunphile'
+     *
+     * const ssg = new Wunphile(import.meta.url)
+     *
+     * // Register pages and static files.
+     * // ...
+     *
+     * await ssg.cli()
+     * ```
+     *
+     * @returns {Promise<void>}
+     */
     async cli() {
         if (!isMainThread) {
             return
@@ -1106,6 +1273,9 @@ Environment variables:
 
             return
         }
+
+        // Wait client manager to be ready, then mount client paths.
+        await this.#clientManager.waitForModules()
 
         if (args.includes('--dev') || args.includes('-d')) {
             const httpPort = parseInt(process.env[DEV_PORT_ENV_VAR] || '3000')
@@ -1271,6 +1441,16 @@ const RenderFragmentType = {
      * Will not be sanitized.
      */
     HTML: 1,
+
+    /**
+     * Behavior module import.
+     */
+    BEHAVIOR_MODULE: 2,
+
+    /**
+     * Loader for module imports.
+     */
+    BEHAVIOR_MODULE_LOADER: 3,
 }
 
 /**
@@ -1321,6 +1501,14 @@ export class RenderFragment {
     value
 
     /**
+     * The attached behavior module promise.
+     * This is null if the fragment is not a behavior module import.
+     * @type {Promise<any> | null}
+     * @readonly
+     */
+    behaviorModulePromise
+
+    /**
      * Renders the fragment to HTML.
      * @returns {string}
      */
@@ -1330,6 +1518,11 @@ export class RenderFragment {
                 return sanitizeHtml(this.value)
             case RenderFragmentType.HTML:
                 return this.value
+            case RenderFragmentType.BEHAVIOR_MODULE:
+            case RenderFragmentType.BEHAVIOR_MODULE_LOADER:
+                // Behavior modules are not rendered to HTML.
+                // The loader needs to be constructed outside of this function.
+                return ''
             default:
                 throw new Error(
                     `Unknown fragment type: ${this.type}. Valid types are contained in the RenderFragmentType enum.`,
@@ -1341,10 +1534,12 @@ export class RenderFragment {
      * Instantiates a new RenderFragment with the specified type and value.
      * @param {RenderFragmentType} type The fragment type
      * @param {string} value The fragment value
+     * @param {Promise<any> | null} behaviorModulePromise The attached behavior module promise (defaults to null)
      */
-    constructor(type, value) {
+    constructor(type, value, behaviorModulePromise = null) {
         this.type = type
         this.value = value
+        this.behaviorModulePromise = behaviorModulePromise
     }
 }
 
@@ -1353,7 +1548,7 @@ export class RenderFragment {
  * The values can be any type, but all values except render fragments or arrays of render fragments will be sanitized.
  *
  * @example
- * ```ts
+ * ```js
  * const greeting = html`<h1>Hello, ${name}!</h1>`
  * ```
  *
@@ -1387,7 +1582,7 @@ export function html(strs, ...vals) {
  * The string's escape sequences will not be processed.
  *
  * @example
- * ```ts
+ * ```js
  * const greeting = text`Hello, ${name}!`
  * ```
  *
@@ -1401,6 +1596,39 @@ export function text(strs, ...vals) {
     }
 
     return RenderFragment.from(String.raw(strs, ...vals))
+}
+
+/**
+ * Component that renders the behavior module loader.
+ * This is required for any pages' behavior modules to be loaded on the browser.
+ * You can use this component at the end of your page's body.
+ *
+ * @type {Component<void, void>}
+ */
+export const BehaviorLoader = () => {
+    return [new RenderFragment(RenderFragmentType.BEHAVIOR_MODULE_LOADER, '')]
+}
+
+/**
+ * @typedef BehaviorModuleProps
+ * The props type for a behavior module.
+ *
+ * @property {Promise<{ default: BehaviorModule }>} module The promise from the `import()` call for the behavior module. For example, `import('./client/behavior/Greeting.js')`.
+ */
+
+/**
+ * Wraps a component in a behavior.
+ * The first element in the children will be the element passed to the behavior.
+ *
+ * You must use {@link BehaviorLoader} at the end of your page's body, otherwise the behavior module will never be loaded on the browser.
+ * @param {BehaviorModuleProps} props The component's props
+ * @param {RenderFragments} children The component's children (should contain a single parent element)
+ * @returns {RenderFragments} The rendered behavior module
+ *
+ * @type {Component<BehaviorModuleProps, RenderFragments>}
+ */
+export const BehaviorComponent = (props, children) => {
+    return [new RenderFragment(RenderFragmentType.BEHAVIOR_MODULE, '', props.module), ...children]
 }
 
 /**

@@ -89,6 +89,55 @@ It is not a framework for building web apps, and does not provide any dynamic ro
 More complicated frontend integration is out of the scope of this library, but there is nothing stopping developers
 from using it as a basis for a framework that does provide such features.
 
+## Client-Side Behaviors
+
+Wunphile supports client-side behaviors, which are JavaScript modules that run on the browser.
+
+These behaviors can add interactivity to components in a modular way without needing to introduce a build step.
+
+Here's an example of a behavior that add a click counter to a button:
+
+```ts
+// src/component/Counter.ts
+
+import { type Component, html, BehaviorComponent } from 'wunphile'
+
+type CounterProps = {
+    initialCount: number
+}
+
+export const Counter: Component<CounterProps, void> = ({ initialCount }) => {
+    return BehaviorComponent({ module: import('../client/behavior/Counter.ts') }, html`
+        <button data-initial="${initialCount}">Click me!</button>
+    `)
+}
+
+```
+
+```ts
+// src/client/behavior/Counter.js
+
+import type { BehaviorModule } from 'wunphile'
+
+export default {
+    behaviorModuleUrl: import.meta.url,
+    behavior: (_) => {
+        const button = _ as HTMLButtonElement
+        const count = parseInt(button.dataset.initial)!
+        
+        button.addEventListener('click', () => {
+            button.textContent = `Clicked ${count++} times!`
+        })
+    },
+} satisfies BehaviorModule
+```
+
+The behavior module will run on the client as long as you include `${BehaviorLoader()}` at the end of your page component's body.
+Wunphile automatically processes and injects modules into the page when they are used in a component.
+
+Behavior modules can even import normal JavaScript modules, as long as they have no top-level statements or side effects, and are within the client directory.
+Modules written in TypeScript will work without a build step as long as your runtime supports TypeScript (in the case of Deno and Bun, out of the box, and with a flag in Node.js).
+
 ## Development Mode and Hot Reloading
 
 When the `cli` method is called with the `--dev` or `-d` option, a development server will be started.
