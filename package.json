@@ -10,7 +10,7 @@
         "build": "tsc",
         "test": "echo \"Error: no test specified\" && exit 1",
         "format": "prettier --write .",
-        "publish": "npm run build && npm publish --access public"
+        "dopublish": "npm run build && npm publish --access public"
     },
     "repository": {
         "type": "git",

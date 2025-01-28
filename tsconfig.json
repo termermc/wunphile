@@ -16,7 +16,6 @@
         "noImplicitReturns": true,
         "noFallthroughCasesInSwitch": true,
         "forceConsistentCasingInFileNames": true,
-        "allowImportingTsExtensions": true,
         "declaration": true,
         "types": ["node"],
         "outDir": "dist"
