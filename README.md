@@ -78,7 +78,8 @@ While it is not written in TypeScript, the library is fully typed and documented
 Because it is written in JavaScript, it can be used in any non-browser environment, including Deno (2.0+) and Bun.
 In fact, due to it only being a single file with no external build dependencies, it can be used in projects without even needing a package manager!
 
-<sup>1</sup> While building has no external dependencies, development mode has some minimal dependencies to handle MIME resolution and filesystem watching.
+<sup>1</sup> While building has no external dependencies, development mode requires your project to depend on [chokidar](https://www.npmjs.com/package/chokidar) and [mime-db](https://www.npmjs.com/package/mime-db) for filesystem watching and MIME resolution.
+Wunphile includes these as optional dependencies so that builds can reduce install time by just installing the core library.
 
 ### Static
 
