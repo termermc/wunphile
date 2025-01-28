@@ -200,15 +200,17 @@ class ClientManager {
 
     /**
      * The path to the client directory.
+     * Absolute path.
      * @type {string}
      */
-    #rootPath
+    rootPath
 
     /**
      * All currently loaded modules.
+     * The key is the path relative to the client directory.
      * @type {Map<string, LoadedModule>}
      */
-    #loadedModules = new Map()
+    loadedModules = new Map()
 
     /**
      * All currently loading modules.
@@ -222,7 +224,21 @@ class ClientManager {
      * @param {string} rootPath The path to the client directory
      */
     constructor(rootPath) {
-        this.#rootPath = rootPath
+        this.rootPath = pathUtil.resolve(rootPath)
+    }
+
+    /**
+     * Returns the path relative to the client directory, or null if it is outside the client directory.
+     * @param {string} path The path to check
+     * @returns {string | null} The path relative to the client directory, or null if it is outside the client directory
+     */
+    #getPathRelativeToClientDir(path) {
+        const res = pathUtil.relative(this.rootPath, path)
+        if (res.startsWith('..')) {
+            return null
+        } else {
+            return './' + res
+        }
     }
 
     /**
@@ -230,18 +246,31 @@ class ClientManager {
      * Processes behavior modules and makes note of non-behavior modules.
      * @param {any} mod The imported module.
      * @param {string | null} modPath The module's path, or null if this is supposed to be a behavior module.
+     * @param {string} [modSrc] The module's source code, if available to the caller. This function will load it if not provided.
      */
-    async #loadModule(mod, modPath) {
+    async #loadModule(mod, modPath, modSrc) {
         if (typeof mod?.default?.behaviorModuleUrl === 'string') {
             // This is a behavior module.
             const behaviorMod = (/** @type {{ default: BehaviorModule }} */ (mod)).default
-
             const modUrl = behaviorMod.behaviorModuleUrl
 
-            // Load the behavior module's source from the filesystem.
-            const source = await fs.readFile(fileURLToPath(modUrl), 'utf8')
+            const isTypeScript = modUrl.endsWith('.ts')
 
-            /** @type {{ path: string, importsStr: string | null }[]} */
+            const behaviorModPath = pathUtil.resolve(fileURLToPath(modUrl))
+            const behaviorModDir = pathUtil.resolve(pathUtil.dirname(behaviorModPath))
+
+            // TODO Check if path is within the client directory.
+
+            // Load the behavior module's source from the filesystem.
+            /** @type {string} */
+            let source
+            if (modSrc == null) {
+                source = await fs.readFile(behaviorModPath, 'utf8')
+            } else {
+                source = modSrc
+            }
+
+            /** @type {{ fullImportPath: string, relativePath: string, importsStr: string | null }[]} */
             const imports = []
 
             // The first thing we need to do is find all imports and resolve them.
@@ -256,58 +285,73 @@ class ClientManager {
                     }
                 }
 
-                const path = JSON.parse(match.groups.path)
                 const importsRaw = match.groups.imports
                 let importsStr = null
 
+                if (isTypeScript && importsRaw?.startsWith('type ')) {
+                    // Skip type imports.
+                    continue
+                }
+
+                const specifiedPath = /** @type {string} */ (eval(match.groups.path))
+
+                const relativeToRoot = this.#getPathRelativeToClientDir(pathUtil.join(behaviorModDir, specifiedPath))
+                if (relativeToRoot == null) {
+                    throw new Error(`Imported path "${specifiedPath}" specified in behavior module "${behaviorModPath}" is outside the client directory.`)
+                }
+                const fullImportPath = pathUtil.join(this.rootPath, relativeToRoot)
+                let relativeToModDir = pathUtil.relative(behaviorModDir, fullImportPath)
+                if (!relativeToModDir.startsWith('.')) {
+                    relativeToModDir = './' + relativeToModDir
+                }
+
                 // Resolve the imports string.
                 if (importsRaw != null) {
-                    if (importsRaw.startsWith('type ')) {
-                        // Skip type imports.
-                        continue
-                    }
+                    if (isTypeScript) {
+                        if (importsRaw.startsWith('{')) {
+                            importsStr = '{ '
 
-                    if (importsRaw.startsWith('{')) {
-                        importsStr = '{ '
+                            const importStrs = importsRaw.slice(1, -1).split(',')
+                            if (importStrs.length !== 0) {
+                                for (let importStr of importStrs) {
+                                    importStr = importStr.trim()
+                                    if (importStr.startsWith('type ')) {
+                                        // Skip type imports.
+                                        continue
+                                    }
 
-                        const importStrs = importsRaw.slice(1, -1).split(',')
-                        if (importStrs.length !== 0) {
-                            for (let importStr of importStrs) {
-                                importStr = importStr.trim()
-                                if (importStr.startsWith('type ')) {
-                                    // Skip type imports.
-                                    continue
+                                    importsStr += importStr + ', '
                                 }
 
-                                importsStr += importStr + ', '
+                                importsStr = importsStr.slice(0, -2) + ' }'
                             }
-
-                            importsStr = importsStr.slice(0, -2) + ' }'
+                        } else {
+                            importsStr = importsRaw
                         }
                     } else {
                         importsStr = importsRaw
                     }
                 }
 
-                imports.push({ path, importsStr })
+                imports.push({ fullImportPath, relativePath: relativeToModDir, importsStr })
             }
 
             // Load all imports asynchronously.
-            for (const { path } of imports) {
-                const promise = import(path)
+            for (const { fullImportPath } of imports) {
+                const promise = import(fullImportPath)
                 this.#loadingModules.add(promise)
                 promise
-                    .then(mod => this.#loadModule(mod, path))
+                    .then(mod => this.#loadModule(mod, fullImportPath))
                     .finally(() => this.#loadingModules.delete(promise))
             }
 
             // Rewrite the source.
             let out = ''
-            for (const { path, importsStr } of imports) {
+            for (const { relativePath, importsStr } of imports) {
                 if (importsStr == null) {
-                    out += `import ${path}\n`
+                    out += `import ${JSON.stringify(relativePath)}\n`
                 } else {
-                    out += `import ${importsStr} from ${path}\n`
+                    out += `import ${importsStr} from ${JSON.stringify(relativePath)}\n`
                 }
             }
             out += '\nexport default {\n    behaviorModuleUrl: import.meta.url,\n    behavior: '
@@ -328,29 +372,28 @@ class ClientManager {
             }
             out += '}\n'
 
-            const behaviorModPath = fileURLToPath(behaviorMod.behaviorModuleUrl)
-
-            // TODO Check if path is within the client directory.
-
             let modOutPath = behaviorModPath
-            if (modOutPath.endsWith('.ts')) {
+            if (isTypeScript) {
                 modOutPath = modOutPath.slice(0, -3) + '.js'
             }
 
             // Set the loaded module.
-            this.#loadedModules.set(behaviorModPath, {
+            this.loadedModules.set(pathUtil.relative(this.rootPath, behaviorModPath), {
                 type: 'behavior',
                 rewrittenContent: out,
-                rewrittenPath: modOutPath,
+                rewrittenPath: pathUtil.relative(this.rootPath, modOutPath),
             })
         } else {
             if (modPath == null) {
                 throw new Error('Module did not export a default behavior module. Behavior modules must have a default export that adheres to the BehaviorModule type.')
             }
 
-            // TODO Check if path is within the client directory.
+            // Check if path is within the client directory.
+            if (this.#getPathRelativeToClientDir(modPath) == null) {
+                throw new Error(`Module path "${modPath}" is outside the client directory.`)
+            }
 
-            this.#loadedModules.set(modPath, { type: 'plain' })
+            this.loadedModules.set(pathUtil.relative(this.rootPath, modPath), { type: 'plain' })
         }
     }
 
@@ -358,15 +401,17 @@ class ClientManager {
      * Loads a behavior module asynchronously.
      * Expects that the module exports a default {@link BehaviorModule} object.
      *
+     * Call {@link waitForModules} to wait for all modules to load.
+     *
      * @param {Promise<any>} promise The promise from the `import()` call for the behavior module
      */
     loadBehaviorModule(promise) {
         this.#loadingModules.add(promise)
 
         // Don't bother catching errors, let it crash if it fails.
-        promise.then(mod => this.#loadModule(mod, null)).finally(() => {
-            this.#loadingModules.delete(promise)
-        })
+        promise
+            .then(mod => this.#loadModule(mod, null))
+            .finally(() => this.#loadingModules.delete(promise))
     }
 
     /**
@@ -374,8 +419,27 @@ class ClientManager {
      * @returns {Promise<void>}
      */
     async waitForModules() {
-        for (const promise of this.#loadingModules) {
-            await promise
+        while (this.#loadingModules.size > 0) {
+            for (const promise of this.#loadingModules) {
+                await new Promise(setImmediate)
+                await promise
+            }
+        }
+    }
+
+    /**
+     * @param {Wunphile} ssg
+     * @returns {Promise<void>}
+     */
+    async testStuff(ssg) {
+        await this.waitForModules()
+
+        for (const [path, mod] of this.loadedModules) {
+            if (mod.type === 'behavior') {
+                ssg.page('/_wfclient/' + mod.rewrittenPath, () => html(mod.rewrittenContent))
+            } else {
+                ssg.staticFile('/_wfclient/' + path, pathUtil.relative('./', pathUtil.join(this.rootPath, path)))
+            }
         }
     }
 }
@@ -440,6 +504,23 @@ export class Wunphile {
     #staticFileMappings = new Map()
 
     /**
+     * @type {ClientManager}
+     */
+    #clientManager
+
+    /**
+     * Preloads a behavior module.
+     * @param {Promise<any>} promise The promise from the `import()` call for the behavior module
+     */
+    preloadBehaviorModule(promise) {
+        this.#clientManager.loadBehaviorModule(promise)
+    }
+
+    async testClientStuff() {
+        await this.#clientManager.testStuff(this)
+    }
+
+    /**
      * Creates a new Wunphile instance.
      *
      * @example
@@ -458,9 +539,14 @@ export class Wunphile {
      * Used to resolve the root path and for identifying the main module for hot reloading.
      */
     constructor(importMetaUrl) {
+        const mainModulePath = fileURLToPath(importMetaUrl)
+        const clientDir = pathUtil.join(pathUtil.dirname(mainModulePath), 'client')
+
+        this.#clientManager = new ClientManager(clientDir)
+
         if (isMainThread) {
             // Resolve paths
-            this.#mainModulePath = fileURLToPath(importMetaUrl)
+            this.#mainModulePath = mainModulePath
             this.#rootPath = pathUtil.resolve(
                 process.env[ROOT_PATH_ENV_VAR] ||
                     pathUtil.dirname(fileURLToPath(importMetaUrl)),
@@ -722,7 +808,11 @@ export class Wunphile {
 
         // Static files next.
         for (const [dest, src] of this.#staticFileMappings) {
-            await fs.copyFile(this.toProjectPath(src), this.toOutputPath(dest))
+            const outPath = this.toOutputPath(dest)
+            const outDir = pathUtil.dirname(outPath)
+            await fs.mkdir(outDir, { recursive: true })
+
+            await fs.copyFile(this.toProjectPath(src), outPath)
         }
 
         // Pages last.
