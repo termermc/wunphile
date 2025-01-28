@@ -474,10 +474,12 @@ class ClientManager {
             return ''
         }
 
+        const paths = /** @type {Set<string>} */ (new Set(rewrittenRelativePaths))
+
         /** @type {Map<string, string>} */
         const varMappings = new Map()
         let num = 0
-        for (const path of rewrittenRelativePaths) {
+        for (const path of paths) {
             varMappings.set(`behavior${num++}`, path)
         }
 
@@ -510,7 +512,7 @@ function hydrate(mod, path) {
         let out = hydrateScript + '\n'
         for (const [varName, path] of varMappings) {
             out += `import ${varName} from '${CLIENT_MOUNT_PREFIX}${path}'\n`
-            out += `hydrate(${varName}, '${path}')`
+            out += `hydrate(${varName}, '${path}')\n`
         }
 
         return out
