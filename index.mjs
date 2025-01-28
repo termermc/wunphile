@@ -813,18 +813,19 @@ export class Wunphile {
      */
     redirect(path, url) {
         this.page(path, () => html`
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1">
-                <title>Redirecting to ${url}...</title>
-            </head>
-            <body>
-                Redirecting to <a href="${url}">${url}</a>... (click link if nothing happens)
-                <meta http-equiv="refresh" content="0; url=${url}">
-                <script>location.assign(${html(JSON.stringify(url))})</script>
-            </body>
-            </html>
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Redirecting to ${url}...</title>
+</head>
+<body>
+    Redirecting to <a href="${url}">${url}</a>... (click link if nothing happens)
+    <meta http-equiv="refresh" content="0; url=${url}">
+    <script>location.assign(${html(JSON.stringify(url))})</script>
+</body>
+</html>
         `)
     }
 
