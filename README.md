@@ -159,17 +159,27 @@ This means that the main module should not contain any extra code besides what i
 
 <details>
 <summary>Using NPM</summary>
-<code lang="shell">npm install --save-dev wunphile</code>
+<code lang="shell">npm install wunphile</code>
 </details>
 
 <details>
 <summary>Using PNPM</summary>
-<code lang="shell">pnpm add --save-dev wunphile</code>
+<code lang="shell">pnpm add wunphile</code>
 </details>
 
 <details>
 <summary>Using Yarn</summary>
-<code lang="shell">yarn add --dev wunphile</code>
+<code lang="shell">yarn add wunphile</code>
+</details>
+
+<details>
+<summary>Using Bun</summary>
+<code lang="shell">bun add wunphile</code>
+</details>
+
+<details>
+<summary>Using Deno</summary>
+<code lang="shell">deno install npm:wunphile</code>
 </details>
 
 <details>
