@@ -32,7 +32,7 @@ ssg.page('/test.html', () => html`<h1>Hello from ${config.siteName}!</h1>`)
 // The "getAllBlogPosts" function could be reading markdown files from a directory,
 // pulling from a database, or even fetching data from an API.
 for (const post of await getAllBlogPosts()) {
-    ssg.page(`/blog/${post.slug}/index.html`, () => new BlogPostPage({ post }))
+    ssg.page(`/blog/${post.slug}/index.html`, () => BlogPostPage({ post }))
 }
 
 // We mount static files from a local "assets" directory to the "/static" path.
@@ -115,7 +115,7 @@ export const Counter: Component<CounterProps, void> = ({ initialCount }) => {
 ```
 
 ```ts
-// src/client/behavior/Counter.js
+// src/client/behavior/Counter.ts
 
 import type { BehaviorModule } from 'wunphile'
 
