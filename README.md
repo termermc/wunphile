@@ -1,5 +1,7 @@
 # Wunphile
 
+[![npm](https://img.shields.io/npm/v/wunphile.svg)](https://www.npmjs.com/package/wunphile)
+
 Simple, imperative JavaScript-based static site generator, compatible with Node.js, Deno (2.0+), and Bun.
 
 ## About
