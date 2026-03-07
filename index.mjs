@@ -293,7 +293,7 @@ class ClientManager {
             /** @type {string} */
             let source
             if (modSrc == null) {
-                source = await fs.readFile(behaviorModPath, 'utf8')
+                source = (await fs.readFile(behaviorModPath, 'utf8')).toString()
             } else {
                 source = modSrc
             }
@@ -1244,16 +1244,20 @@ export class Wunphile {
                         if ((await statOrNull(fsPath)) !== null) {
                             // Open file read stream.
                             const file = await fs.open(fsPath, 'r')
-                            const readStream = file.createReadStream()
+                            try {
+                                const readStream = file.createReadStream()
 
-                            res.writeHead(200, { 'Content-Type': mime })
-                            await new Promise((promRes, rej) => {
-                                readStream
-                                    .pipe(res)
-                                    .on('close', promRes)
-                                    .on('error', rej)
-                            })
-                            res.end()
+                                res.writeHead(200, { 'Content-Type': mime })
+                                await new Promise((promRes, rej) => {
+                                    readStream
+                                        .pipe(res)
+                                        .on('close', promRes)
+                                        .on('error', rej)
+                                })
+                                res.end()
+                            } finally {
+                                await file.close()
+                            }
 
                             return true
                         }
