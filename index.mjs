@@ -192,7 +192,8 @@ function* splitIter(str, separator) {
  * The imports (if any) are captured in the named group "imports".
  * @type {RegExp}
  */
-const importStmtRegex = /^\s*import\s+(?<imports>.* from)?\s*(?<path>["'].+["'])/
+const importStmtRegex =
+    /^\s*import\s+(?<imports>.* from)?\s*(?<path>["'].+["'])/
 
 /**
  * Regex that matches an export statement line.
@@ -275,13 +276,16 @@ class ClientManager {
     async #loadModule(mod, modPath, modSrc) {
         if (typeof mod?.default?.behaviorModuleUrl === 'string') {
             // This is a behavior module.
-            const behaviorMod = (/** @type {{ default: BehaviorModule }} */ (mod)).default
+            const behaviorMod = /** @type {{ default: BehaviorModule }} */ (mod)
+                .default
             const modUrl = behaviorMod.behaviorModuleUrl
 
             const isTypeScript = modUrl.endsWith('.ts')
 
             const behaviorModPath = pathUtil.resolve(fileURLToPath(modUrl))
-            const behaviorModDir = pathUtil.resolve(pathUtil.dirname(behaviorModPath))
+            const behaviorModDir = pathUtil.resolve(
+                pathUtil.dirname(behaviorModPath),
+            )
 
             // TODO Check if path is within the client directory.
 
@@ -317,14 +321,26 @@ class ClientManager {
                     continue
                 }
 
-                const specifiedPath = /** @type {string} */ (eval(match.groups.path))
+                const specifiedPath = /** @type {string} */ (
+                    eval(match.groups.path)
+                )
 
-                const relativeToRoot = this.#getPathRelativeToClientDir(pathUtil.join(behaviorModDir, specifiedPath))
+                const relativeToRoot = this.#getPathRelativeToClientDir(
+                    pathUtil.join(behaviorModDir, specifiedPath),
+                )
                 if (relativeToRoot == null) {
-                    throw new Error(`Imported path "${specifiedPath}" specified in behavior module "${behaviorModPath}" is outside the client directory.`)
+                    throw new Error(
+                        `Imported path "${specifiedPath}" specified in behavior module "${behaviorModPath}" is outside the client directory.`,
+                    )
                 }
-                const fullImportPath = pathUtil.join(this.rootPath, relativeToRoot)
-                let relativeToModDir = pathUtil.relative(behaviorModDir, fullImportPath)
+                const fullImportPath = pathUtil.join(
+                    this.rootPath,
+                    relativeToRoot,
+                )
+                let relativeToModDir = pathUtil.relative(
+                    behaviorModDir,
+                    fullImportPath,
+                )
                 if (!relativeToModDir.startsWith('.')) {
                     relativeToModDir = './' + relativeToModDir
                 }
@@ -335,7 +351,9 @@ class ClientManager {
                         if (importsRaw.startsWith('{')) {
                             importsStr = '{ '
 
-                            const importStrs = importsRaw.slice(1, -1).split(',')
+                            const importStrs = importsRaw
+                                .slice(1, -1)
+                                .split(',')
                             if (importStrs.length !== 0) {
                                 for (let importStr of importStrs) {
                                     importStr = importStr.trim()
@@ -357,7 +375,11 @@ class ClientManager {
                     }
                 }
 
-                imports.push({ fullImportPath, relativePath: relativeToModDir, importsStr })
+                imports.push({
+                    fullImportPath,
+                    relativePath: relativeToModDir,
+                    importsStr,
+                })
             }
 
             // Load all imports asynchronously.
@@ -365,10 +387,12 @@ class ClientManager {
                 const promise = import(fullImportPath)
                 this.#loadingModules.add(promise)
                 promise
-                    .then(mod => this.#loadModule(mod, fullImportPath))
-                    .catch(err => {
+                    .then((mod) => this.#loadModule(mod, fullImportPath))
+                    .catch((err) => {
                         if (err instanceof ReferenceError) {
-                            console.error(`Caught ReferenceError while loading module "${fullImportPath}". This is likely due to a module with side effects (such as using browser APIs). Please remove side effects from behavior modules.`)
+                            console.error(
+                                `Caught ReferenceError while loading module "${fullImportPath}". This is likely due to a module with side effects (such as using browser APIs). Please remove side effects from behavior modules.`,
+                            )
                         }
 
                         throw err
@@ -385,7 +409,8 @@ class ClientManager {
                     out += `import ${importsStr} from ${JSON.stringify(relativePath)}\n`
                 }
             }
-            out += '\nexport default {\n    behaviorModuleUrl: import.meta.url,\n    behavior: '
+            out +=
+                '\nexport default {\n    behaviorModuleUrl: import.meta.url,\n    behavior: '
             if (behaviorMod.behavior == null) {
                 out += 'undefined,\n'
             } else {
@@ -396,7 +421,9 @@ class ClientManager {
                 out += 'undefined,\n'
             } else {
                 out += '{\n'
-                for (const [key, val] of Object.entries(behaviorMod.functions)) {
+                for (const [key, val] of Object.entries(
+                    behaviorMod.functions,
+                )) {
                     out += `        ${JSON.stringify(key)}: ${val.toString()},\n`
                 }
                 out += '    },\n'
@@ -410,25 +437,38 @@ class ClientManager {
 
             // Set the loaded module and mount it.
             const rewrittenPath = pathUtil.relative(this.rootPath, modOutPath)
-            this.loadedModules.set(pathUtil.relative(this.rootPath, behaviorModPath), {
-                type: 'behavior',
-                rewrittenContent: out,
-                rewrittenPath,
-            })
+            this.loadedModules.set(
+                pathUtil.relative(this.rootPath, behaviorModPath),
+                {
+                    type: 'behavior',
+                    rewrittenContent: out,
+                    rewrittenPath,
+                },
+            )
             this.#ssg.pageRaw(CLIENT_MOUNT_PREFIX + rewrittenPath, out)
         } else {
             if (modPath == null) {
-                throw new Error('Module did not export a default behavior module. Behavior modules must have a default export that adheres to the BehaviorModule type.')
+                throw new Error(
+                    'Module did not export a default behavior module. Behavior modules must have a default export that adheres to the BehaviorModule type.',
+                )
             }
 
             // Check if path is within the client directory.
             if (this.#getPathRelativeToClientDir(modPath) == null) {
-                throw new Error(`Module path "${modPath}" is outside the client directory.`)
+                throw new Error(
+                    `Module path "${modPath}" is outside the client directory.`,
+                )
             }
 
             const relativePath = pathUtil.relative(this.rootPath, modPath)
             this.loadedModules.set(relativePath, { type: 'plain' })
-            this.#ssg.staticFile(CLIENT_MOUNT_PREFIX + relativePath, pathUtil.relative('./', pathUtil.join(this.rootPath, relativePath)))
+            this.#ssg.staticFile(
+                CLIENT_MOUNT_PREFIX + relativePath,
+                pathUtil.relative(
+                    './',
+                    pathUtil.join(this.rootPath, relativePath),
+                ),
+            )
         }
     }
 
@@ -445,7 +485,7 @@ class ClientManager {
 
         // Don't bother catching errors, let it crash if it fails.
         promise
-            .then(mod => this.#loadModule(mod, null))
+            .then((mod) => this.#loadModule(mod, null))
             .finally(() => this.#loadingModules.delete(promise))
     }
 
@@ -474,7 +514,9 @@ class ClientManager {
             return ''
         }
 
-        const paths = /** @type {Set<string>} */ (new Set(rewrittenRelativePaths))
+        const paths = /** @type {Set<string>} */ (
+            new Set(rewrittenRelativePaths)
+        )
 
         /** @type {Map<string, string>} */
         const varMappings = new Map()
@@ -621,7 +663,10 @@ export class Wunphile {
     constructor(importMetaUrl, clientDir = './src/client') {
         const mainModulePath = fileURLToPath(importMetaUrl)
 
-        this.#clientManager = new ClientManager(this, pathUtil.join(pathUtil.dirname(mainModulePath), clientDir))
+        this.#clientManager = new ClientManager(
+            this,
+            pathUtil.join(pathUtil.dirname(mainModulePath), clientDir),
+        )
 
         if (isMainThread) {
             // Resolve paths
@@ -669,7 +714,10 @@ export class Wunphile {
             const fragment = fragments[i]
 
             if (fragment.type === RenderFragmentType.BEHAVIOR_MODULE) {
-                const prom = /** @type {Promise<{ default: BehaviorModule }>} */ (fragment.behaviorModulePromise)
+                const prom =
+                    /** @type {Promise<{ default: BehaviorModule }>} */ (
+                        fragment.behaviorModulePromise
+                    )
                 this.#clientManager.loadBehaviorModule(prom)
                 fragProms.set(i, prom)
             }
@@ -684,11 +732,17 @@ export class Wunphile {
          */
         const fragMods = new Map()
         for (const [i, prom] of fragProms.entries()) {
-            const mod = (/** @type {{ default: BehaviorModule }} */ (await prom)).default
-            const relativePath = pathUtil.relative(this.#clientManager.rootPath, fileURLToPath(mod.behaviorModuleUrl))
+            const mod = /** @type {{ default: BehaviorModule }} */ (await prom)
+                .default
+            const relativePath = pathUtil.relative(
+                this.#clientManager.rootPath,
+                fileURLToPath(mod.behaviorModuleUrl),
+            )
             const info = this.#clientManager.loadedModules.get(relativePath)
             if (info?.type !== 'behavior') {
-                throw new Error(`Supposed behavior module "${relativePath}" is not a behavior module.`)
+                throw new Error(
+                    `Supposed behavior module "${relativePath}" is not a behavior module.`,
+                )
             }
 
             fragMods.set(i, info.rewrittenPath)
@@ -704,13 +758,19 @@ export class Wunphile {
                 const relativePath = /** @type {string} */ (fragMods.get(i))
 
                 // We add a hydration comment that will be used by the loader to find components to apply behaviors to.
-                res.push(`<!--${CLIENT_BEHAVIOR_HYDRATE_PREFIX}${relativePath}-->`)
-            } else if (fragment.type === RenderFragmentType.BEHAVIOR_MODULE_LOADER) {
+                res.push(
+                    `<!--${CLIENT_BEHAVIOR_HYDRATE_PREFIX}${relativePath}-->`,
+                )
+            } else if (
+                fragment.type === RenderFragmentType.BEHAVIOR_MODULE_LOADER
+            ) {
                 // TODO Figure out loader.
                 // We should mount a loader script and then include it as a tag if set in settings.
                 // For now, we're going to inline it to get out an MVP.
 
-                res.push(`<script type="module">\n${this.#clientManager.generateLoaderScript([...fragMods.values()])}\n</script>`)
+                res.push(
+                    `<script type="module">\n${this.#clientManager.generateLoaderScript([...fragMods.values()])}\n</script>`,
+                )
             } else {
                 res.push(fragment.toHtml())
             }
@@ -785,7 +845,7 @@ export class Wunphile {
         if (isMainThread) {
             this.#pageMapping.set(path, component)
         } else {
-            this.#renderToHtmlAsync(component()).then(content => {
+            this.#renderToHtmlAsync(component()).then((content) => {
                 // Send content to main thread.
                 parentPort.postMessage({
                     type: 'pageRaw',
@@ -802,7 +862,7 @@ export class Wunphile {
      * @param {string} content The page's content
      */
     pageRaw(path, content) {
-        this.page(path , () => html(content))
+        this.page(path, () => html(content))
     }
 
     /**
@@ -812,21 +872,30 @@ export class Wunphile {
      * @param {string} url The URL/path to redirect to
      */
     redirect(path, url) {
-        this.page(path, () => html`
-<!doctype html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Redirecting to ${url}...</title>
-</head>
-<body>
-    Redirecting to <a href="${url}">${url}</a>... (click link if nothing happens)
-    <meta http-equiv="refresh" content="0; url=${url}">
-    <script>location.assign(${html(JSON.stringify(url))})</script>
-</body>
-</html>
-        `)
+        this.page(
+            path,
+            () => html`
+                <!doctype html>
+                <html lang="en">
+                    <head>
+                        <meta charset="UTF-8" />
+                        <meta
+                            name="viewport"
+                            content="width=device-width, initial-scale=1"
+                        />
+                        <title>Redirecting to ${url}...</title>
+                    </head>
+                    <body>
+                        Redirecting to <a href="${url}">${url}</a>... (click
+                        link if nothing happens)
+                        <meta http-equiv="refresh" content="0; url=${url}" />
+                        <script>
+                            location.assign(${html(JSON.stringify(url))})
+                        </script>
+                    </body>
+                </html>
+            `,
+        )
     }
 
     /**
@@ -1635,7 +1704,14 @@ export const BehaviorLoader = () => {
  * @type {Component<BehaviorModuleProps, RenderFragments>}
  */
 export const BehaviorComponent = (props, children) => {
-    return [new RenderFragment(RenderFragmentType.BEHAVIOR_MODULE, '', props.module), ...children]
+    return [
+        new RenderFragment(
+            RenderFragmentType.BEHAVIOR_MODULE,
+            '',
+            props.module,
+        ),
+        ...children,
+    ]
 }
 
 /**
