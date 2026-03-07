@@ -1147,17 +1147,21 @@ export class Wunphile {
                         if ((await statOrNull(fsPath)) !== null) {
                             // Open file read stream.
                             const file = await fs.open(fsPath, 'r')
-                            const readStream = file.createReadStream()
-                            console.log(`Serving ${path}`)
+                            try {
+                                const readStream = file.createReadStream()
+                                console.log(`Serving ${path}`)
 
-                            res.writeHead(200, { 'Content-Type': mime })
-                            await new Promise((promRes, rej) => {
-                                readStream
-                                    .pipe(res)
-                                    .on('close', promRes)
-                                    .on('error', rej)
-                            })
-                            res.end()
+                                res.writeHead(200, { 'Content-Type': mime })
+                                await new Promise((promRes, rej) => {
+                                    readStream
+                                        .pipe(res)
+                                        .on('close', promRes)
+                                        .on('error', rej)
+                                })
+                                res.end()
+                            } finally {
+                                await file.close()
+                            }
 
                             return true
                         }
