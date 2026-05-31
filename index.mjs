@@ -1802,23 +1802,8 @@ export async function copyRecursive(source, target) {
     }
 }
 
-// Constants and utils for sanitizing HTML
-/** @type {Record<string, string>} */
-const htmlEntityReplacements = {
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#x27;',
-}
-const htmlEntityRegex = /[&<>"']/g
-/**
- * @param {string} match
- * @returns {string}
- */
-function htmlEntityReplacer(match) {
-    return htmlEntityReplacements[match]
-}
+// Regex that matches HTML entities.
+const htmlEntityRegex = /[&<>"']/
 
 /**
  * Sanitizes the provided HTML by escaping HTML entities
@@ -1827,5 +1812,49 @@ function htmlEntityReplacer(match) {
  * @since 1.0.0
  */
 export function sanitizeHtml(html) {
-    return String(html).replace(htmlEntityRegex, htmlEntityReplacer)
+    // Adapted from https://github.com/component/escape-html
+
+    const match = htmlEntityRegex.exec(html)
+    if (match === null) {
+        return html
+    }
+
+    let index = 0
+    let lastIndex = 0
+    let out = ''
+    let escape = ''
+    for (index = match.index; index < html.length; index++) {
+        switch (html.charCodeAt(index)) {
+            case 34: // "
+                escape = '&quot;'
+                break
+            case 38: // &
+                escape = '&amp;'
+                break
+            case 39: // '
+                escape = '&#39;'
+                break
+            case 60: // <
+                escape = '&lt;'
+                break
+            case 62: // >
+                escape = '&gt;'
+                break
+            default:
+                continue
+        }
+
+        if (lastIndex !== index) {
+            out += html.substring(lastIndex, index)
+        }
+
+        lastIndex = index + 1
+        out += escape
+    }
+
+    if (lastIndex !== index) {
+        return out + html.substring(lastIndex)
+    }
+
+    return out
 }
