@@ -276,8 +276,7 @@ class ClientManager {
     async #loadModule(mod, modPath, modSrc) {
         if (typeof mod?.default?.behaviorModuleUrl === 'string') {
             // This is a behavior module.
-            const behaviorMod = /** @type {{ default: BehaviorModule }} */ (mod)
-                .default
+            const behaviorMod = /** @type {BehaviorModule} */ (mod.default)
             const modUrl = behaviorMod.behaviorModuleUrl
 
             const isTypeScript = modUrl.endsWith('.ts')
@@ -732,8 +731,7 @@ export class Wunphile {
          */
         const fragMods = new Map()
         for (const [i, prom] of fragProms.entries()) {
-            const mod = /** @type {{ default: BehaviorModule }} */ (await prom)
-                .default
+            const mod = /** @type {BehaviorModule} */ ((await prom).default)
             const relativePath = pathUtil.relative(
                 this.#clientManager.rootPath,
                 fileURLToPath(mod.behaviorModuleUrl),
@@ -872,30 +870,25 @@ export class Wunphile {
      * @param {string} url The URL/path to redirect to
      */
     redirect(path, url) {
-        this.page(
-            path,
-            () => html`
-                <!doctype html>
-                <html lang="en">
-                    <head>
-                        <meta charset="UTF-8" />
-                        <meta
-                            name="viewport"
-                            content="width=device-width, initial-scale=1"
-                        />
-                        <title>Redirecting to ${url}...</title>
-                    </head>
-                    <body>
-                        Redirecting to <a href="${url}">${url}</a>... (click
-                        link if nothing happens)
-                        <meta http-equiv="refresh" content="0; url=${url}" />
-                        <script>
-                            location.assign(${html(JSON.stringify(url))})
-                        </script>
-                    </body>
-                </html>
-            `,
-        )
+        // prettier-ignore
+        this.page(path, () => html`
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1"
+        />
+        <title>Redirecting to ${url}...</title>
+    </head>
+    <body>
+        Redirecting to <a href="${url}">${url}</a>... (click link if nothing happens)
+        <meta http-equiv="refresh" content="0; url=${url}" />
+        <script>location.assign(${html(JSON.stringify(url))})</script>
+    </body>
+</html>
+        `)
     }
 
     /**
