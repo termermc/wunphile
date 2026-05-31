@@ -4,6 +4,8 @@
 
 Simple, imperative JavaScript-based static site generator, compatible with Node.js, Deno (2.0+), and Bun.
 
+Implemented in a single file with no mandatory dependencies, Wunphile is an SSG that will still work in 5 years.
+
 ## About
 
 Wunphile (pronounced "one file") allows you to build your site as if it was an Express-like app, but generate a nice, static bundle.
