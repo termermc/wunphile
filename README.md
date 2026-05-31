@@ -109,10 +109,9 @@ type CounterProps = {
 }
 
 export const Counter: Component<CounterProps, void> = ({ initialCount }) => {
-    return BehaviorComponent(
-        { module: import('../client/behavior/Counter.ts') },
-        html` <button data-initial="${initialCount}">Click me!</button> `,
-    )
+    return BehaviorComponent({ module: import('../client/behavior/Counter.ts') }, html`
+        <button data-initial="${initialCount}">Click me!</button>
+    `)
 }
 ```
 
