@@ -279,7 +279,7 @@ class ClientManager {
             const behaviorMod = /** @type {BehaviorModule} */ (mod.default)
             const modUrl = behaviorMod.behaviorModuleUrl
 
-            const isTypeScript = modUrl.endsWith('.ts')
+            const isTypeScript = modUrl.endsWith('.ts') || modUrl.endsWith('.mts')
 
             const behaviorModPath = pathUtil.resolve(fileURLToPath(modUrl))
             const behaviorModDir = pathUtil.resolve(
