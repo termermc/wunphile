@@ -239,3 +239,10 @@ Install the [es6-string-html](https://marketplace.visualstudio.com/items?itemNam
 ### JetBrains IDEs
 
 Recent versions of JetBrains IDEs should support syntax highlighting and intellisense for HTML inside template literals out of the box.
+
+## Contributing
+
+If you have found a bug, feel free to open an issue or send a PR that fixes it.
+
+If you're interested in adding a feature, please open an issue first so that we can discuss it. I consider Wunphile to
+be functionally complete, so I am unlikely to merge unsolicited PRs for new features. 
