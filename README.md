@@ -74,7 +74,7 @@ along with a handful of Node.js APIs for interacting with the filesystem.
 
 ### Pure JavaScript
 
-This library consists of a single pure JavaScript file, and building<sup>1</sup> has no dependencies other than Node.js APIs.
+This library consists of a single pure JavaScript file with no mandatory<sup>1</sup> dependencies other than Node.js APIs.
 Instead of using JSX, it takes advantage of the JavaScript template literal syntax to provide a simple, safe API for writing HTML.
 
 While it is not written in TypeScript, the library is fully typed and documented using JSDoc.
@@ -82,8 +82,9 @@ While it is not written in TypeScript, the library is fully typed and documented
 Because it is written in JavaScript, it can be used in any non-browser environment, including Deno (2.0+) and Bun.
 In fact, due to it only being a single file with no external build dependencies, it can be used in projects without even needing a package manager!
 
-<sup>1</sup> While building has no external dependencies, development mode requires your project to depend on [mime-db](https://www.npmjs.com/package/mime-db) for MIME resolution.
-Wunphile includes these as optional dependencies so that builds can reduce install time by just installing the core library.
+<sup>1</sup> While there are no mandatory dependencies, development mode requires some way to map file extensions to
+MIME types. Wunphile's NPM package includes [mime-db](https://www.npmjs.com/package/mime-db) as a dev dependency to
+provide MIME mappings. If you are using Wunphile without NPM, see [Development Without NPM](#development-without-npm).
 
 ### Static
 
@@ -157,6 +158,21 @@ To disable hot reloading entirely, set the `SSG_DEV_NO_HOT_RELOAD` environment v
 
 Note that whenever the site is hot reloaded, the main module will be re-run in a worker thread.
 This means that the main module should not contain any extra code besides what is necessary to build the site.
+
+### Development Without NPM
+
+Development mode requires some way to map file extensions to MIME types. Normally, this is handled by Wunphile's NPM
+dependency on [mime-db](https://www.npmjs.com/package/mime-db), but there are other ways to provide it.
+
+On Linux and BSD systems,
+[FreeDesktop's Shared MIME-Info Database](https://specifications.freedesktop.org/shared-mime-info/latest/ar01s02.html#s2_layout)
+can be used for MIME resolution. If you only ever intend on developing your project from a system that has this, there
+is nothing else you need to add.
+
+On platforms without FreeDesktop, such as Windows and MacOS, you can save `mime-db`'s
+[db.json](https://raw.githubusercontent.com/jshttp/mime-db/refs/heads/master/db.json) as `mime-db.json` in the same
+folder as your copy of Wunphile and it will be used instead of trying to use the NPM version of `mime-db`. For example,
+if you have Wunphile saved as `wunphile/index.mjs` in your project, there should also be a `wunphile/mime-db.json` file.
 
 ## Installation
 

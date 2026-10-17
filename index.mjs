@@ -1,3 +1,4 @@
+import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 import { EventEmitter } from 'node:events'
 
@@ -779,6 +780,121 @@ export class Wunphile {
     }
 
     /**
+     * Loads a mapping of lowercase file extensions (without the leading `.`) to their file extension.
+     * If no mappings can be resolved, returns null.
+     * @returns {Promise<Map<string, string> | null>}
+     */
+    async #loadExtToMime() {
+        /** @typedef {Record<string, { extensions?: readonly string[] }>} MimeDatabase */
+
+        // First, let's try and load something `mime-db`-like.
+        /** @type {MimeDatabase | undefined} */
+        let mimeDb
+
+        try {
+            // Try to use NPM copy.
+            mimeDb = (await import('mime-db')).default
+
+            console.log('Using MIME type mappings from NPM mime-db')
+        } catch {
+            // Try to use a vendored copy.
+            try {
+                const filename = 'mime-db.json'
+                const vendorPath = pathUtil.join(import.meta.dirname, filename)
+                mimeDb = (
+                    await import(vendorPath, {
+                        with: { type: 'json' },
+                    })
+                ).default
+
+                console.log('Using MIME type mappings from ' + filename)
+            } catch {}
+        }
+
+        if (mimeDb) {
+            // We found a mime-db.
+
+            /** @type {Map<string, string>} */
+            const extToMime = new Map()
+            for (const mime in mimeDb) {
+                const info = mimeDb[mime]
+
+                if (info.extensions) {
+                    for (const ext of info.extensions) {
+                        extToMime.set(ext, mime)
+                    }
+                }
+            }
+
+            return extToMime
+        }
+
+        // If we're on a UNIX-like operating system, we have some options to resolve it from the system.
+        // We sometimes have a file containing MIMEs and their extension associations.
+        // Each line looks something like this: `image/svg+xml:*.svg`
+        if (process.platform !== 'win32') {
+            const globPaths = [
+                '/usr/share/mime/globs2',
+                '/usr/local/share/mime/globs2',
+                '/usr/pkg/share/mime/globs2',
+                '/usr/share/mime/globs',
+                '/usr/local/share/mime/globs',
+                '/usr/pkg/share/mime/globs',
+            ]
+            for (const globPath of globPaths) {
+                try {
+                    const str = (await fs.readFile(globPath, 'utf8')).toString()
+
+                    console.log('Using MIME type mappings from ' + globPath)
+
+                    let lns = str
+                        .split('\n')
+                        .filter(
+                            (ln) => !ln.startsWith('# ') && ln.includes(':'),
+                        )
+                    if (globPath.endsWith('2')) {
+                        /** @type {[number, string][]} */
+                        const weighted = lns.map((raw) => {
+                            const colonIdx = raw.indexOf(':')
+                            const weight = parseFloat(
+                                raw.substring(0, colonIdx),
+                            )
+                            const ln = raw.substring(colonIdx + 1)
+                            return [weight, ln]
+                        })
+                        weighted.sort(([a], [b]) => b - a)
+
+                        // This is a weighted file; we need to sort the lines first.
+                        lns = weighted.map(([, ln]) => ln)
+                    }
+
+                    /** @type {Map<string, string>} */
+                    const extToMime = new Map()
+                    for (const ln of lns) {
+                        const [mime, glob] = ln.split(':')
+
+                        const extIdx = glob.lastIndexOf('*.')
+                        if (extIdx === -1) {
+                            continue
+                        }
+
+                        const ext = glob.substring(extIdx + 2)
+
+                        if (!extToMime.has(ext)) {
+                            extToMime.set(ext, mime)
+                        }
+                    }
+
+                    return extToMime
+                } catch {}
+            }
+        }
+
+        // Oh well, we tried.
+        return null
+    }
+
+    /**
      * Overrides the root path.
      * The root path is normally specified by the `SSG_ROOT_PATH` environment variable, or defaults to the directory of the program main module if not specified.
      * @param {string} path The root path
@@ -1103,35 +1219,15 @@ export class Wunphile {
         // Import necessary packages dynamically to avoid importing them when this method is not used.
         const http = await import('node:http')
 
-        /** @type {typeof import('mime-db')} */
-        let mimeDbRaw
-
-        try {
-            mimeDbRaw = /** @type {typeof import('mime-db')} */ (
-                (await import('mime-db')).default
-            )
-        } catch (err) {
+        const extToMime = await this.#loadExtToMime()
+        if (extToMime === null) {
             console.error(
-                'mime-db dependency not available; development mode will not work. Import error:',
-                err,
+                'Could not resolve a MIME database to use development mode.',
             )
             console.error(
-                'To fix this, add mime-db as a dependency for your project, or install wunphile as an NPM dependency.',
+                `Please add the mime-db package to your NPM project or place a copy of mime-db's JSON database next to Wunphile as mime-db.json.`,
             )
             process.exit(1)
-        }
-
-        // Build mapping of extensions to MIME types.
-        /** @type {Map<string, string>} */
-        const extToMime = new Map()
-        for (const mime in mimeDbRaw) {
-            const info = mimeDbRaw[mime]
-
-            if (info.extensions instanceof Array) {
-                for (const ext of info.extensions) {
-                    extToMime.set(ext, mime)
-                }
-            }
         }
 
         /**

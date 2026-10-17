@@ -1,10 +1,5 @@
 {
     "compilerOptions": {
-        "target": "esnext",
-        "module": "nodenext",
-        "rewriteRelativeImportExtensions": true,
-        "erasableSyntaxOnly": true,
-        "verbatimModuleSyntax": true,
         "allowJs": true,
         "checkJs": true,
         "strict": true,
@@ -20,7 +15,16 @@
         "forceConsistentCasingInFileNames": true,
         "declaration": true,
         "types": ["node"],
-        "outDir": "dist"
+        "outDir": "dist",
+        "skipLibCheck": true,
+
+        // Node.js type stripping recommendations.
+        // See https://nodejs.org/api/typescript.html#type-stripping
+        "target": "esnext",
+        "module": "nodenext",
+        "rewriteRelativeImportExtensions": true,
+        "erasableSyntaxOnly": true,
+        "verbatimModuleSyntax": true
     },
     "include": ["index.mjs"]
 }
