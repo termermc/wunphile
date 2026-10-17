@@ -142,7 +142,7 @@ The behavior module will run on the client as long as you include `${BehaviorLoa
 Wunphile automatically processes and injects modules into the page when they are used in a component.
 
 Behavior modules can even import normal JavaScript modules, as long as they have no top-level statements or side effects, and are within the client directory.
-Modules written in TypeScript will work without a build step as long as your runtime supports TypeScript, Bun and which recent versions of Node.js do.
+Modules written in TypeScript will work without a build step on Bun and Node.js 24 or later.
 
 ## Development Mode and Hot Reloading
 
