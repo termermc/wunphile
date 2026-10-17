@@ -36,6 +36,6 @@
         "typescript": "^7.0.2"
     },
     "optionalDependencies": {
-        "mime-db": "^1.43.6"
+        "mime-db": "^1.54.0"
     }
 }
