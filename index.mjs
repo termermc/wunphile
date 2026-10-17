@@ -279,7 +279,8 @@ class ClientManager {
             const behaviorMod = /** @type {BehaviorModule} */ (mod.default)
             const modUrl = behaviorMod.behaviorModuleUrl
 
-            const isTypeScript = modUrl.endsWith('.ts') || modUrl.endsWith('.mts')
+            const isTypeScript =
+                modUrl.endsWith('.ts') || modUrl.endsWith('.mts')
 
             const behaviorModPath = pathUtil.resolve(fileURLToPath(modUrl))
             const behaviorModDir = pathUtil.resolve(
@@ -1102,11 +1103,11 @@ export class Wunphile {
         // Import necessary packages dynamically to avoid importing them when this method is not used.
         const http = await import('node:http')
 
-        /** @type {typeof import('mime-db/index')} */
+        /** @type {typeof import('mime-db')} */
         let mimeDbRaw
 
         try {
-            mimeDbRaw = /** @type {typeof import('mime-db/index')} */ (
+            mimeDbRaw = /** @type {typeof import('mime-db')} */ (
                 (await import('mime-db')).default
             )
         } catch (err) {
@@ -1382,127 +1383,112 @@ Environment variables:
             /** @type {EventEmitter<{ reload: [] }>|null} */
             let hrEmitter = null
 
-            if (process.env[DEV_NO_HOT_RELOAD_ENV_VAR] !== '1') {
-                /** @type {typeof import('chokidar/index')} */
-                let chokidar = /** @type {any} */ (null)
+            if (
+                isWorkerApiSupported &&
+                process.env[DEV_NO_HOT_RELOAD_ENV_VAR] !== '1'
+            ) {
+                hrEmitter = new EventEmitter()
 
-                let isHrEnabled = false
+                let hasPendingReload = false
 
-                if (isWorkerApiSupported) {
-                    try {
-                        // Dynamically import Chokidar to avoid importing it when development mode is not used.
-                        chokidar = await import('chokidar')
+                console.log(
+                    `Development mode hot reloading enabled. Watching "${this.#rootPath}" for changes.`,
+                )
 
-                        isHrEnabled = true
-                    } catch (err) {
-                        console.warn(
-                            'Chokidar file watcher dependency not available; hot reloading will not work. Import error:',
-                            err,
-                        )
-                    }
-                }
+                // We use the non-Promise version of `node:fs` because it accepts a plain callback.
+                const oldFs = await import('node:fs')
+                oldFs.watch(
+                    this.#rootPath,
+                    {
+                        recursive: true,
+                        persistent: true,
+                        ignore: (filename) => {
+                            return pathUtil
+                                .resolve(filename)
+                                .startsWith(this.#outputPath)
+                        },
+                    },
+                    async () => {
+                        if (hasPendingReload) {
+                            return
+                        }
 
-                if (isHrEnabled) {
-                    hrEmitter = new EventEmitter()
+                        hasPendingReload = true
 
-                    let hasPendingReload = false
+                        try {
+                            // Wait a little while to let writes finish.
+                            await new Promise((resolve) =>
+                                setTimeout(resolve, 50),
+                            )
 
-                    console.log(
-                        `Development mode hot reloading enabled. Watching "${this.#rootPath}" for changes.`,
-                    )
+                            // Re-run main module in a worker.
+                            // This is necessary because we have no way of manually clearing the module cache in ESM.
+                            const worker = new Worker(this.#mainModulePath, {
+                                workerData: {
+                                    rootPath: this.#rootPath,
+                                    outputPath: this.#outputPath,
+                                    notFoundPath: this.#notFoundPath,
+                                },
+                            })
 
-                    chokidar
-                        .watch(this.#rootPath, {
-                            ignoreInitial: true,
-                            persistent: true,
-                        })
-                        .on('all', async () => {
-                            if (hasPendingReload) {
-                                return
-                            }
+                            let gotError = false
 
-                            hasPendingReload = true
+                            /** @type {Map<string, Component<void, void>>} */
+                            const pageMapping = new Map()
+                            /** @type {Map<string, string>} */
+                            const staticDirMapping = new Map()
+                            /** @type {Map<string, string>} */
+                            const staticFileMapping = new Map()
 
-                            try {
-                                // Wait a little while to let writes finish.
-                                await new Promise((resolve) =>
-                                    setTimeout(resolve, 50),
-                                )
-
-                                // Re-run main module in a worker.
-                                // This is necessary because we have no way of manually clearing the module cache in ESM.
-                                const worker = new Worker(
-                                    this.#mainModulePath,
-                                    {
-                                        workerData: {
-                                            rootPath: this.#rootPath,
-                                            outputPath: this.#outputPath,
-                                            notFoundPath: this.#notFoundPath,
-                                        },
-                                    },
-                                )
-
-                                let gotError = false
-
-                                /** @type {Map<string, Component<void, void>>} */
-                                const pageMapping = new Map()
-                                /** @type {Map<string, string>} */
-                                const staticDirMapping = new Map()
-                                /** @type {Map<string, string>} */
-                                const staticFileMapping = new Map()
-
-                                // Receive mappings from worker.
-                                worker.on(
-                                    'message',
-                                    /** @type {(msg: any) => void} */ (
-                                        (msg) => {
-                                            switch (msg.type) {
-                                                case 'pageRaw':
-                                                    pageMapping.set(
-                                                        msg.path,
-                                                        () => html(msg.content),
-                                                    )
-                                                    break
-                                                case 'staticDir':
-                                                    staticDirMapping.set(
-                                                        msg.path,
-                                                        msg.dir,
-                                                    )
-                                                    break
-                                                case 'staticFile':
-                                                    staticFileMapping.set(
-                                                        msg.path,
-                                                        msg.file,
-                                                    )
-                                                    break
-                                            }
+                            // Receive mappings from worker.
+                            worker.on(
+                                'message',
+                                /** @type {(msg: any) => void} */ (
+                                    (msg) => {
+                                        switch (msg.type) {
+                                            case 'pageRaw':
+                                                pageMapping.set(msg.path, () =>
+                                                    html(msg.content),
+                                                )
+                                                break
+                                            case 'staticDir':
+                                                staticDirMapping.set(
+                                                    msg.path,
+                                                    msg.dir,
+                                                )
+                                                break
+                                            case 'staticFile':
+                                                staticFileMapping.set(
+                                                    msg.path,
+                                                    msg.file,
+                                                )
+                                                break
                                         }
-                                    ),
-                                )
-                                worker.on('error', (err) => {
-                                    gotError = true
-                                    console.error('Error while reloading:', err)
-                                })
+                                    }
+                                ),
+                            )
+                            worker.on('error', (err) => {
+                                gotError = true
+                                console.error('Error while reloading:', err)
+                            })
 
-                                // Wait for reload to finish.
-                                await new Promise((res) =>
-                                    worker.on('exit', res),
-                                )
+                            // Wait for reload to finish.
+                            await new Promise((res) => worker.on('exit', res))
 
-                                if (!gotError) {
-                                    // Replace mappings.
-                                    this.#pageMapping = pageMapping
-                                    this.#staticDirMappings = staticDirMapping
-                                    this.#staticFileMappings = staticFileMapping
-                                }
-
-                                // @ts-expect-error hrEmitter is assigned by now
-                                hrEmitter.emit('reload')
-                            } finally {
-                                hasPendingReload = false
+                            if (!gotError) {
+                                // Replace mappings.
+                                this.#pageMapping = pageMapping
+                                this.#staticDirMappings = staticDirMapping
+                                this.#staticFileMappings = staticFileMapping
                             }
-                        })
-                }
+
+                            // @ts-expect-error hrEmitter is assigned by now
+                            hrEmitter.emit('reload')
+                        } finally {
+                            hasPendingReload = false
+                        }
+                    },
+                )
             }
 
             await this.serve(httpPort, httpHost, hrEmitter)
@@ -1516,11 +1502,13 @@ Environment variables:
     }
 }
 
+/** @typedef {0 | 1 | 2 | 3} RenderFragmentEnum Render fragment types. */
+
 /**
  * Render fragment types.
- * @enum {number}
+ * @type {Record<string, RenderFragmentEnum>}
  */
-const RenderFragmentType = {
+export const RenderFragmentType = {
     /**
      * Text.
      * Will be sanitized.
@@ -1578,7 +1566,7 @@ export class RenderFragment {
 
     /**
      * The fragment type.
-     * @type {RenderFragmentType}
+     * @type {RenderFragmentEnum}
      * @readonly
      */
     type
@@ -1623,7 +1611,7 @@ export class RenderFragment {
 
     /**
      * Instantiates a new RenderFragment with the specified type and value.
-     * @param {RenderFragmentType} type The fragment type
+     * @param {RenderFragmentEnum} type The fragment type
      * @param {string} value The fragment value
      * @param {Promise<any> | null} behaviorModulePromise The attached behavior module promise (defaults to null)
      */

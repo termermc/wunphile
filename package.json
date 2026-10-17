@@ -1,17 +1,16 @@
 {
     "name": "wunphile",
-    "version": "1.1.6",
+    "version": "1.1.7",
     "description": "Simple, imperative JavaScript-based static site generator",
-    "main": "dist/index.mjs",
+    "main": "index.mjs",
     "type": "module",
     "types": "dist/index.d.mts",
     "typings": "dist/index.d.mts",
     "scripts": {
         "build": "tsc",
         "check": "tsc --noEmit",
-        "test": "echo \"Error: no test specified\" && exit 1",
         "fmt": "prettier --write .",
-        "dopublish": "npm run build && npm publish --access public"
+        "dopublish": "node --run check && node --run build && npm publish --access public"
     },
     "repository": {
         "type": "git",
@@ -31,13 +30,12 @@
         "url": "https://github.com/termermc/wunphile/issues"
     },
     "devDependencies": {
-        "@types/mime-db": "^1.43.5",
-        "@types/node": "^22.7.5",
-        "prettier": "^3.3.3",
-        "typescript": "^5.6.3"
+        "@types/mime-db": "^1.43.6",
+        "@types/node": "^24.19.2",
+        "prettier": "^3.9.10",
+        "typescript": "^7.0.2"
     },
     "optionalDependencies": {
-        "chokidar": "^4.0.3",
-        "mime-db": "^1.53.0"
+        "mime-db": "^1.43.6"
     }
 }

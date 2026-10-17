@@ -1,8 +1,10 @@
 {
     "compilerOptions": {
-        "target": "ES2022",
-        "module": "esnext",
-        "moduleResolution": "node",
+        "target": "esnext",
+        "module": "nodenext",
+        "rewriteRelativeImportExtensions": true,
+        "erasableSyntaxOnly": true,
+        "verbatimModuleSyntax": true,
         "allowJs": true,
         "checkJs": true,
         "strict": true,
