@@ -1,5 +1,8 @@
 {
 	"compilerOptions": {
+		"target": "esnext",
+		"module": "nodenext",
+		"verbatimModuleSyntax": true,
 		"allowJs": true,
 		"checkJs": true,
 		"strict": true,
@@ -16,15 +19,7 @@
 		"declaration": true,
 		"types": ["node"],
 		"outDir": "dist",
-		"skipLibCheck": true,
-
-		// Node.js type stripping recommendations.
-		// See https://nodejs.org/api/typescript.html#type-stripping
-		"target": "esnext",
-		"module": "nodenext",
-		"rewriteRelativeImportExtensions": true,
-		"erasableSyntaxOnly": true,
-		"verbatimModuleSyntax": true
+		"skipLibCheck": true
 	},
 	"include": ["index.mjs", "prettier.config.mjs"]
 }
