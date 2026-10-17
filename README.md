@@ -2,9 +2,11 @@
 
 [![npm](https://img.shields.io/npm/v/wunphile.svg)](https://www.npmjs.com/package/wunphile)
 
-Simple, imperative JavaScript-based static site generator, compatible with Node.js, Deno (2.0+), and Bun.
+Simple, imperative JavaScript-based static site generator, compatible with Node.js and Bun.
 
-Implemented in a single file with no mandatory dependencies, Wunphile is an SSG that will still work in 5 years.
+Implemented as a single file with no mandatory dependencies, Wunphile is an SSG that will still work in 5 years.
+
+Either `npm install wunphile` or drop [index.mjs](index.mjs) into your project and import it.
 
 ## About
 
