@@ -1,39 +1,39 @@
 {
-    "name": "wunphile",
-    "version": "1.2.0",
-    "description": "Simple, imperative JavaScript-based static site generator",
-    "main": "index.mjs",
-    "type": "module",
-    "types": "dist/index.d.mts",
-    "typings": "dist/index.d.mts",
-    "scripts": {
-        "build": "tsc",
-        "check": "tsc --noEmit",
-        "fmt": "prettier --write .",
-        "dopublish": "node --run check && node --run build && npm publish --access public"
-    },
-    "repository": {
-        "type": "git",
-        "url": "git+https://github.com/termermc/wunphile.git"
-    },
-    "keywords": [
-        "static",
-        "site",
-        "generator",
-        "simple",
-        "js",
-        "imperative"
-    ],
-    "author": "termer",
-    "license": "MIT",
-    "bugs": {
-        "url": "https://github.com/termermc/wunphile/issues"
-    },
-    "devDependencies": {
-        "@types/mime-db": "^1.43.6",
-        "@types/node": "^24.19.2",
-        "prettier": "^3.9.10",
-        "typescript": "^7.0.2",
-        "mime-db": "^1.54.0"
-    }
+	"name": "wunphile",
+	"version": "1.2.0",
+	"description": "Simple, imperative JavaScript-based static site generator",
+	"main": "index.mjs",
+	"type": "module",
+	"types": "dist/index.d.mts",
+	"typings": "dist/index.d.mts",
+	"scripts": {
+		"build": "tsc",
+		"check": "tsc --noEmit",
+		"fmt": "prettier --write .",
+		"dopublish": "node --run check && node --run build && npm publish --access public"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/termermc/wunphile.git"
+	},
+	"keywords": [
+		"static",
+		"site",
+		"generator",
+		"simple",
+		"js",
+		"imperative"
+	],
+	"author": "termer",
+	"license": "MIT",
+	"bugs": {
+		"url": "https://github.com/termermc/wunphile/issues"
+	},
+	"devDependencies": {
+		"@types/mime-db": "^1.43.6",
+		"@types/node": "^24.19.2",
+		"prettier": "^3.9.10",
+		"typescript": "^7.0.2",
+		"mime-db": "^1.54.0"
+	}
 }
