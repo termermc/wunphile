@@ -1010,35 +1010,53 @@ export class Wunphile {
         }
 
         // Static dirs first.
+        /** @type {Promise<void>[]} */
+        const dirProms = []
         for (const [dest, src] of this.#staticDirMappings) {
-            await copyRecursive(
-                this.toProjectPath(src),
-                this.toOutputPath(dest),
+            dirProms.push(
+                copyRecursive(this.toProjectPath(src), this.toOutputPath(dest)),
             )
         }
+        await Promise.all(dirProms)
 
         // Static files next.
+        /** @type {Promise<void>[]} */
+        const staticProms = []
         for (const [dest, src] of this.#staticFileMappings) {
-            const outPath = this.toOutputPath(dest)
-            const outDir = pathUtil.dirname(outPath)
-            await fs.mkdir(outDir, { recursive: true })
+            staticProms.push(
+                (async () => {
+                    const outPath = this.toOutputPath(dest)
+                    const outDir = pathUtil.dirname(outPath)
 
-            await fs.copyFile(this.toProjectPath(src), outPath)
-        }
-
-        // Pages last.
-        for (const [dest, component] of this.#pageMapping) {
-            // Create containing directory if it doesn't exist.
-            const dir = pathUtil.dirname(pathUtil.join(this.#outputPath, dest))
-            if ((await statOrNull(dir)) === null) {
-                await fs.mkdir(dir, { recursive: true })
-            }
-
-            await fs.writeFile(
-                pathUtil.join(this.#outputPath, dest),
-                await this.#renderToHtmlAsync(component()),
+                    await fs.mkdir(outDir, { recursive: true })
+                    await fs.copyFile(this.toProjectPath(src), outPath)
+                })(),
             )
         }
+        await Promise.all(staticProms)
+
+        // Pages last.
+        /** @type {Promise<void>[]} */
+        const pageProms = []
+        for (const [dest, component] of this.#pageMapping) {
+            pageProms.push(
+                (async () => {
+                    // Create containing directory if it doesn't exist.
+                    const dir = pathUtil.dirname(
+                        pathUtil.join(this.#outputPath, dest),
+                    )
+                    if ((await statOrNull(dir)) === null) {
+                        await fs.mkdir(dir, { recursive: true })
+                    }
+
+                    await fs.writeFile(
+                        pathUtil.join(this.#outputPath, dest),
+                        await this.#renderToHtmlAsync(component()),
+                    )
+                })(),
+            )
+        }
+        await Promise.all(pageProms)
     }
 
     /**
