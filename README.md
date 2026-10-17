@@ -81,7 +81,7 @@ Instead of using JSX, it takes advantage of the JavaScript template literal synt
 
 While it is not written in TypeScript, the library is fully typed and documented using JSDoc.
 
-Because it is written in JavaScript, it can be used in any non-browser environment, including Deno (2.0+) and Bun.
+Because it is written in JavaScript, it can be used in any non-browser environment, including Bun.
 In fact, due to it only being a single file with no external build dependencies, it can be used in projects without even needing a package manager!
 
 <sup>1</sup> While there are no mandatory dependencies, development mode requires some way to map file extensions to
@@ -142,7 +142,7 @@ The behavior module will run on the client as long as you include `${BehaviorLoa
 Wunphile automatically processes and injects modules into the page when they are used in a component.
 
 Behavior modules can even import normal JavaScript modules, as long as they have no top-level statements or side effects, and are within the client directory.
-Modules written in TypeScript will work without a build step as long as your runtime supports TypeScript (in the case of Deno and Bun, out of the box, and with a flag in Node.js).
+Modules written in TypeScript will work without a build step as long as your runtime supports TypeScript, Bun and which recent versions of Node.js do.
 
 ## Development Mode and Hot Reloading
 
@@ -196,11 +196,6 @@ if you have Wunphile saved as `wunphile/index.mjs` in your project, there should
 <details>
 <summary>Using Bun</summary>
 <code lang="shell">bun add wunphile</code>
-</details>
-
-<details>
-<summary>Using Deno</summary>
-<code lang="shell">deno install npm:wunphile</code>
 </details>
 
 <details>
