@@ -170,6 +170,7 @@ const CLIENT_BEHAVIOR_HYDRATE_PREFIX = 'wf-behavior:'
 
 import * as fs from 'node:fs/promises'
 import * as pathUtil from 'node:path'
+import { pipeline } from 'node:stream/promises'
 
 /**
  * Iterator that splits a string by a separator.
@@ -625,6 +626,12 @@ export class Wunphile {
 	 * @type {ClientManager}
 	 */
 	#clientManager
+
+	/**
+	 * The timestamp when the site was last reloaded.
+	 * @type {number}
+	 */
+	#lastReload = -1
 
 	/**
 	 * Preloads a behavior module.
@@ -1133,7 +1140,10 @@ export class Wunphile {
 
 		// Static dirs first.
 		for (const [dest, src] of this.#staticDirMappings) {
-			await copyRecursive(this.toProjectPath(src), this.toOutputPath(dest))
+			await copyRecursive(
+				this.toProjectPath(src),
+				this.toOutputPath(dest),
+			)
 		}
 
 		// Static files next.
@@ -1148,9 +1158,7 @@ export class Wunphile {
 		// Pages last.
 		for (const [dest, component] of this.#pageMapping) {
 			// Create containing directory if it doesn't exist.
-			const dir = pathUtil.dirname(
-				pathUtil.join(this.#outputPath, dest),
-			)
+			const dir = pathUtil.dirname(pathUtil.join(this.#outputPath, dest))
 			if ((await statOrNull(dir)) === null) {
 				await fs.mkdir(dir, { recursive: true })
 			}
@@ -1232,21 +1240,48 @@ export class Wunphile {
 		}
 
 		// Inject script at the end of pages that triggers a reload when a request to `/__hotreload` responds.
-		/** @type {string} */
-		let trailer
+		const mkTrailer = () => {
+			if (hotReloadEventEmitter === null) {
+				return ''
+			}
+
+			return `
+<!-- Injected by Wunphile for development mode hot reloading -->
+<script type="module">
+if (!window.__wunphile_hotreload) {
+	window.__wunphile_hotreload = true
+	let abort
+	let abortTimeout = 0
+	while (true) {
+		abort?.abort()
+		clearTimeout(abort)
+		abort = new AbortController()
+		abortTimeout = setTimeout(() => abort.abort(), 1_000)
+		try {
+			const res = await fetch('/__hotreload', { signal: abort.signal })
+			const rlTime = parseInt(res.headers.get('X-Wunphile-Reload')) || Number.MAX_SAFE_INTEGER
+			if (rlTime <= ${this.#lastReload}) {
+				await res.text()
+			}
+			window.location.reload()
+		} catch (err) {
+			if (!(err instanceof DOMException && err.name === 'AbortError')) {
+				console.error('hot reload check failed, sleeping')
+				await new Promise(res => setTimeout(res, 1_000))
+			}
+		}
+	}
+}
+</script>`
+		}
 		/** @type {import('node:http').ServerResponse[]} */
 		const waitResponses = []
-		if (hotReloadEventEmitter === null) {
-			trailer = ''
-		} else {
-			trailer = `
-<!-- Injected by Wunphile for development mode hot reloading -->
-<script>fetch('/__hotreload').then(() => window.location.reload())</script>`
-
+		if (hotReloadEventEmitter != null) {
 			hotReloadEventEmitter.on('reload', () => {
+				this.#lastReload = Date.now()
+
 				// Resolve all pending responses.
 				for (const res of waitResponses) {
-					res.writeHead(200, { 'Content-Type': 'text/html' })
 					res.write('ok')
 					res.end()
 				}
@@ -1262,7 +1297,22 @@ export class Wunphile {
 			const basePath = url.pathname
 
 			if (hotReloadEventEmitter !== null && basePath === '/__hotreload') {
+				res.writeHead(200, {
+					'Content-Type': 'text/html',
+					'X-Wunphile-Reload': String(this.#lastReload),
+					'Content-Length': 5
+				})//
+				res.write('...')
+
 				// Put response in a queue so that it can be resolved upon a "reload" event.
+				res.req.on('close', () => {
+					for (let i = 0; i < waitResponses.length; i++) {
+						if (waitResponses[i] === res) {
+							waitResponses.splice(i, 1)
+							break
+						}
+					}
+				})
 				waitResponses.push(res)
 				return
 			}
@@ -1291,7 +1341,7 @@ export class Wunphile {
 					if (mime === 'text/html') {
 						console.log(`Serving ${path}`)
 						// Page is HTML; inject trailer.
-						res.write(trailer)
+						res.write(mkTrailer())
 					}
 					res.end()
 
@@ -1309,22 +1359,15 @@ export class Wunphile {
 						)
 						if ((await statOrNull(fsPath)) !== null) {
 							// Open file read stream.
-							const file = await fs.open(fsPath, 'r')
-							try {
-								const readStream = file.createReadStream()
-								console.log(`Serving ${path}`)
+							await using file = await fs.open(fsPath, 'r')
 
-								res.writeHead(200, { 'Content-Type': mime })
-								await new Promise((promRes, rej) => {
-									readStream
-										.pipe(res)
-										.on('close', promRes)
-										.on('error', rej)
-								})
-								res.end()
-							} finally {
-								await file.close()
-							}
+							console.log(`Serving ${path}`)
+
+							res.writeHead(200, { 'Content-Type': mime })
+							try {
+								await pipeline(file.createReadStream(), res)
+							} catch {}
+							res.end()
 
 							return true
 						}
@@ -1337,7 +1380,7 @@ export class Wunphile {
 						const fsPath = this.toProjectPath(filePath)
 						if ((await statOrNull(fsPath)) !== null) {
 							// Open file read stream.
-							const file = await fs.open(fsPath, 'r')
+							await using file = await fs.open(fsPath, 'r')
 							try {
 								const readStream = file.createReadStream()
 
