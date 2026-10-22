@@ -1118,62 +1118,48 @@ export class Wunphile {
 			await fs.mkdir(this.#outputPath, { recursive: true })
 		} else {
 			// Output directory exists, clear it.
+			/** @type {Promise<void>[]} */
+			const proms = []
 			for (const file of await fs.readdir(this.#outputPath)) {
-				await fs.rm(this.toOutputPath(file), {
-					recursive: true,
-					force: true,
-				})
+				proms.push(
+					fs.rm(this.toOutputPath(file), {
+						recursive: true,
+						force: true,
+					}),
+				)
 			}
+			await Promise.all(proms)
 		}
 
 		// Static dirs first.
-		/** @type {Promise<void>[]} */
-		const dirProms = []
 		for (const [dest, src] of this.#staticDirMappings) {
-			dirProms.push(
-				copyRecursive(this.toProjectPath(src), this.toOutputPath(dest)),
-			)
+			await copyRecursive(this.toProjectPath(src), this.toOutputPath(dest))
 		}
-		await Promise.all(dirProms)
 
 		// Static files next.
-		/** @type {Promise<void>[]} */
-		const staticProms = []
 		for (const [dest, src] of this.#staticFileMappings) {
-			staticProms.push(
-				(async () => {
-					const outPath = this.toOutputPath(dest)
-					const outDir = pathUtil.dirname(outPath)
+			const outPath = this.toOutputPath(dest)
+			const outDir = pathUtil.dirname(outPath)
 
-					await fs.mkdir(outDir, { recursive: true })
-					await fs.copyFile(this.toProjectPath(src), outPath)
-				})(),
-			)
+			await fs.mkdir(outDir, { recursive: true })
+			await fs.copyFile(this.toProjectPath(src), outPath)
 		}
-		await Promise.all(staticProms)
 
 		// Pages last.
-		/** @type {Promise<void>[]} */
-		const pageProms = []
 		for (const [dest, component] of this.#pageMapping) {
-			pageProms.push(
-				(async () => {
-					// Create containing directory if it doesn't exist.
-					const dir = pathUtil.dirname(
-						pathUtil.join(this.#outputPath, dest),
-					)
-					if ((await statOrNull(dir)) === null) {
-						await fs.mkdir(dir, { recursive: true })
-					}
+			// Create containing directory if it doesn't exist.
+			const dir = pathUtil.dirname(
+				pathUtil.join(this.#outputPath, dest),
+			)
+			if ((await statOrNull(dir)) === null) {
+				await fs.mkdir(dir, { recursive: true })
+			}
 
-					await fs.writeFile(
-						pathUtil.join(this.#outputPath, dest),
-						await this.#renderToHtmlAsync(component()),
-					)
-				})(),
+			await fs.writeFile(
+				pathUtil.join(this.#outputPath, dest),
+				await this.#renderToHtmlAsync(component()),
 			)
 		}
-		await Promise.all(pageProms)
 	}
 
 	/**
