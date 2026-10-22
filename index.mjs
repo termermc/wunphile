@@ -1300,8 +1300,8 @@ if (!window.__wunphile_hotreload) {
 				res.writeHead(200, {
 					'Content-Type': 'text/html',
 					'X-Wunphile-Reload': String(this.#lastReload),
-					'Content-Length': 5
-				})//
+					'Content-Length': 5,
+				})
 				res.write('...')
 
 				// Put response in a queue so that it can be resolved upon a "reload" event.
