@@ -8,6 +8,8 @@ Implemented as a single file with no mandatory dependencies, Wunphile is an SSG 
 
 Either `npm install wunphile` or drop [index.mjs](index.mjs) into your project and import it.
 
+Get started with the [blog template](https://github.com/termermc/wunphile-template), or read on.
+
 ## About
 
 Wunphile (pronounced "one file") allows you to build your site as if it was an Express-like app, but generate a nice, static bundle.
