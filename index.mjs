@@ -1,6 +1,7 @@
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 import { EventEmitter } from 'node:events'
+import { createHash } from 'node:crypto'
 
 // Import worker thread APIs dynamically.
 // If the APIs are not available, we disable functionality that depends on them.
@@ -234,8 +235,16 @@ class ClientManager {
 	 * All currently loaded modules.
 	 * The key is the path relative to the client directory.
 	 * @type {Map<string, LoadedModule>}
+	 * @internal For internal use only, may be removed or renamed between patch releases.
 	 */
 	loadedModules = new Map()
+
+	/**
+	 * Promises for modules currently being processed.
+	 * The keys are the same as {@link loadedModules}'s keys.
+	 * @type {Map<string, Promise<void>>}
+	 */
+	#processingModules = new Map()
 
 	/**
 	 * All currently loading modules.
@@ -273,32 +282,63 @@ class ClientManager {
 	 * Processes behavior modules and makes note of non-behavior modules.
 	 * @param {any} mod The imported module.
 	 * @param {string | null} modPath The module's path, or null if this is supposed to be a behavior module.
-	 * @param {string} [modSrc] The module's source code, if available to the caller. This function will load it if not provided.
 	 */
-	async #loadModule(mod, modPath, modSrc) {
-		if (typeof mod?.default?.behaviorModuleUrl === 'string') {
-			// This is a behavior module.
-			const behaviorMod = /** @type {BehaviorModule} */ (mod.default)
-			const modUrl = behaviorMod.behaviorModuleUrl
+	async #loadModule(mod, modPath) {
+		// Is this a behavior module?
+		if (typeof mod?.default?.behaviorModuleUrl !== 'string') {
+			if (modPath == null) {
+				throw new Error(
+					'Module did not export a default behavior module. Behavior modules must have a default export that adheres to the BehaviorModule type.',
+				)
+			}
 
+			// Check if path is within the client directory.
+			if (this.#getPathRelativeToClientDir(modPath) == null) {
+				throw new Error(
+					`Module path "${modPath}" is outside the client directory.`,
+				)
+			}
+
+			const relativePath = pathUtil.relative(this.rootPath, modPath)
+			this.loadedModules.set(relativePath, { type: 'plain' })
+			this.#ssg.staticFile(
+				CLIENT_MOUNT_PREFIX + relativePath,
+				pathUtil.relative(
+					'./',
+					pathUtil.join(this.rootPath, relativePath),
+				),
+			)
+			return
+		}
+
+		// This is a behavior module.
+		const behaviorMod = /** @type {BehaviorModule} */ (mod.default)
+		const modUrl = behaviorMod.behaviorModuleUrl
+
+		const behaviorModPath = pathUtil.resolve(fileURLToPath(modUrl))
+		const loadedModKey = pathUtil.relative(this.rootPath, behaviorModPath)
+
+		// Is it already loading?
+		let loaderProm = this.#processingModules.get(loadedModKey)
+		if (loaderProm != null) {
+			// Wait until it's loaded.
+			await loaderProm
+			return
+		}
+
+		// Not already loading, load it and let other concurrent calls wait on it.
+		loaderProm = (async () => {
 			const isTypeScript =
 				modUrl.endsWith('.ts') || modUrl.endsWith('.mts')
 
-			const behaviorModPath = pathUtil.resolve(fileURLToPath(modUrl))
 			const behaviorModDir = pathUtil.resolve(
 				pathUtil.dirname(behaviorModPath),
 			)
 
-			// TODO Check if path is within the client directory.
-
 			// Load the behavior module's source from the filesystem.
-			/** @type {string} */
-			let source
-			if (modSrc == null) {
-				source = (await fs.readFile(behaviorModPath, 'utf8')).toString()
-			} else {
-				source = modSrc
-			}
+			const source = (
+				await fs.readFile(behaviorModPath, 'utf8')
+			).toString()
 
 			/** @type {{ fullImportPath: string, relativePath: string, importsStr: string | null }[]} */
 			const imports = []
@@ -437,41 +477,28 @@ class ClientManager {
 				modOutPath = modOutPath.slice(0, -3) + '.js'
 			}
 
+			// Calculate hash to use in the module's rewritten path.
+			const hash = createHash('sha256')
+				.update(source)
+				.digest('base64url')
+				.slice(0, 8)
+
 			// Set the loaded module and mount it.
-			const rewrittenPath = pathUtil.relative(this.rootPath, modOutPath)
-			this.loadedModules.set(
-				pathUtil.relative(this.rootPath, behaviorModPath),
-				{
-					type: 'behavior',
-					rewrittenContent: out,
-					rewrittenPath,
-				},
+			const ext = pathUtil.extname(modOutPath)
+			const rewrittenPath = pathUtil.relative(
+				this.rootPath,
+				modOutPath.substring(0, modOutPath.length - ext.length) + '-' + hash + ext
 			)
+
+			this.loadedModules.set(loadedModKey, {
+				type: 'behavior',
+				rewrittenContent: out,
+				rewrittenPath,
+			})
 			this.#ssg.pageRaw(CLIENT_MOUNT_PREFIX + rewrittenPath, out)
-		} else {
-			if (modPath == null) {
-				throw new Error(
-					'Module did not export a default behavior module. Behavior modules must have a default export that adheres to the BehaviorModule type.',
-				)
-			}
-
-			// Check if path is within the client directory.
-			if (this.#getPathRelativeToClientDir(modPath) == null) {
-				throw new Error(
-					`Module path "${modPath}" is outside the client directory.`,
-				)
-			}
-
-			const relativePath = pathUtil.relative(this.rootPath, modPath)
-			this.loadedModules.set(relativePath, { type: 'plain' })
-			this.#ssg.staticFile(
-				CLIENT_MOUNT_PREFIX + relativePath,
-				pathUtil.relative(
-					'./',
-					pathUtil.join(this.rootPath, relativePath),
-				),
-			)
-		}
+		})()
+		this.#processingModules.set(loadedModKey, loaderProm)
+		await loaderProm
 	}
 
 	/**
@@ -520,13 +547,6 @@ class ClientManager {
 			new Set(rewrittenRelativePaths)
 		)
 
-		/** @type {Map<string, string>} */
-		const varMappings = new Map()
-		let num = 0
-		for (const path of paths) {
-			varMappings.set(`behavior${num++}`, path)
-		}
-
 		const hydrateScript = `
 function hydrate(mod, path) {
     const comment = '${CLIENT_BEHAVIOR_HYDRATE_PREFIX}' + path
@@ -554,9 +574,8 @@ function hydrate(mod, path) {
         `.trim()
 
 		let out = hydrateScript + '\n'
-		for (const [varName, path] of varMappings) {
-			out += `import ${varName} from '${CLIENT_MOUNT_PREFIX}${path}'\n`
-			out += `hydrate(${varName}, '${path}')\n`
+		for (const path of paths) {
+			out += `import('${CLIENT_MOUNT_PREFIX}${path}').then(mod => hydrate(mod.default, '${path}'))`
 		}
 
 		return out
@@ -771,13 +790,11 @@ export class Wunphile {
 			} else if (
 				fragment.type === RenderFragmentType.BEHAVIOR_MODULE_LOADER
 			) {
-				// TODO Figure out loader.
-				// We should mount a loader script and then include it as a tag if set in settings.
-				// For now, we're going to inline it to get out an MVP.
-
-				res.push(
-					`<script type="module">\n${this.#clientManager.generateLoaderScript([...fragMods.values()])}\n</script>`,
-				)
+				if (fragMods.size !== 0) {
+					res.push(
+						`<script type="module">\n${this.#clientManager.generateLoaderScript([...fragMods.values()])}\n</script>`,
+					)
+				}
 			} else {
 				res.push(fragment.toHtml())
 			}
