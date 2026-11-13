@@ -25,35 +25,35 @@ import { getAllBlogPosts } from './util/blog.js'
 import IndexPage from './component/page/IndexPage.js'
 import BlogPostPage from './component/page/BlogPostPage.js'
 
-const ssg = new Wunphile(import.meta.url)
+const wunphile = new Wunphile(import.meta.url)
 
 // We use the `page` to register components for pages.
-ssg.page('/index.html', IndexPage)
+wunphile.page('/index.html', IndexPage)
 
 // Components are simply functions that return HTML using the "html" template function.
 // Similarly to React, strings interpolated into the template function will be sanitized.
 // The "html" template function takes in a template string and returns React-style RenderFragments.
 // No JSX needed!
-ssg.page('/test.html', () => html`<h1>Hello from ${config.siteName}!</h1>`)
+wunphile.page('/test.html', () => html`<h1>Hello from ${config.siteName}!</h1>`)
 
 // We can write any logic we want to drive site generation.
 // The "getAllBlogPosts" function could be reading markdown files from a directory,
 // pulling from a database, or even fetching data from an API.
 for (const post of await getAllBlogPosts()) {
-    ssg.page(`/blog/${post.slug}/index.html`, () => BlogPostPage({ post }))
+    wunphile.page(`/blog/${post.slug}/index.html`, () => BlogPostPage({ post }))
 }
 
 // We mount static files from a local "assets" directory to the "/static" path.
 // So if there is a file named "logo.png" in the "assets" directory, it will be served at "/static/logo.png".
-ssg.staticDir('/static', './assets')
+wunphile.staticDir('/static', './assets')
 
 // We can also mount individual static files.
 // The line below will mount the local file "./metadata-files/favicon.ico" to the "/favicon.ico" path.
-ssg.staticFile('/favicon.ico', './metadata-files/favicon.ico')
+wunphile.staticFile('/favicon.ico', './metadata-files/favicon.ico')
 
 // Runs the site generator CLI.
 // The CLI can build the site or serve it on a local HTTP server for development.
-await ssg.cli()
+await wunphile.cli()
 ```
 
 The above code will look very familiar to anyone who has used Express or a similar imperative-style web framework.

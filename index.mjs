@@ -1,5 +1,7 @@
 import process from 'node:process'
-import { fileURLToPath } from 'node:url'
+// FIX #2: pathToFileURL is required to turn Windows absolute paths
+// ("D:\...") into file: URLs before passing them to dynamic import().
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { EventEmitter } from 'node:events'
 import { createHash } from 'node:crypto'
 // Import worker thread APIs dynamically.
@@ -30,38 +32,47 @@ try {
 const parentPort = /** @type {MessagePort} */ (
 	/** @type {unknown} */ (parentPortImpl)
 )
+// REFACTOR: All seven SSG_* contract names and values are intentionally
+// unchanged; only their documentation notes the reason.
 /**
  * The name of the environment variable that specifies the root path.
+ * Kept with the SSG_ prefix for backward compatibility; WUNPHILE_ prefixed aliases may be introduced in a future major release.
  * @type {string}
  */
 export const ROOT_PATH_ENV_VAR = 'SSG_ROOT_PATH'
 /**
  * The name of the environment variable that specifies the output path.
+ * Kept with the SSG_ prefix for backward compatibility; WUNPHILE_ prefixed aliases may be introduced in a future major release.
  * @type {string}
  */
 export const OUTPUT_PATH_ENV_VAR = 'SSG_OUTPUT_PATH'
 /**
  * The name of the environment variable that specifies the path to use for the not found page.
+ * Kept with the SSG_ prefix for backward compatibility; WUNPHILE_ prefixed aliases may be introduced in a future major release.
  * @type {string}
  */
 export const NOT_FOUND_PATH_ENV_VAR = 'SSG_NOT_FOUND_PATH'
 /**
  * The name of the environment variable that specifies the development server port.
+ * Kept with the SSG_ prefix for backward compatibility; WUNPHILE_ prefixed aliases may be introduced in a future major release.
  * @type {string}
  */
 export const DEV_PORT_ENV_VAR = 'SSG_DEV_PORT'
 /**
  * The name of the environment variable that specifies the development server host.
+ * Kept with the SSG_ prefix for backward compatibility; WUNPHILE_ prefixed aliases may be introduced in a future major release.
  * @type {string}
  */
 export const DEV_HOST_ENV_VAR = 'SSG_DEV_HOST'
 /**
  * The name of the environment variable that specifies whether hot reloading is enabled in development mode.
+ * Kept with the SSG_ prefix for backward compatibility; WUNPHILE_ prefixed aliases may be introduced in a future major release.
  * @type {string}
  */
 export const DEV_NO_HOT_RELOAD_ENV_VAR = 'SSG_DEV_NO_HOT_RELOAD'
 /**
  * The name of the environment variable that specifies whether hot reloading is enabled in development mode.
+ * Kept with the SSG_ prefix for backward compatibility; WUNPHILE_ prefixed aliases may be introduced in a future major release.
  * @type {string}
  */
 export const DEV_NO_INJECT_ENV_VAR = 'SSG_DEV_NO_INJECT'
@@ -94,34 +105,31 @@ const CLIENT_BEHAVIOR_HYDRATE_PREFIX = 'wf-behavior:'
 function toPosixPath(path) {
 	return path.split('\\').join('/')
 }
+import * as fs from 'node:fs/promises'
+import * as pathUtil from 'node:path'
+import { pipeline } from 'node:stream/promises'
+// FIX #9: Only one ESM-safe relPosix() helper remains (see JSDoc below).
 /**
  * Computes a relative path between two filesystem paths and normalizes it
  * to POSIX-style separators, suitable for use as a URL segment or as a
  * stable Map key across platforms.
+ * POSIX-normalizing wrapper around `pathUtil.relative`.
+ *
+ * FIX #9: Removed the dead `relativePosix()` (it depended on the CommonJS
+ * `require` helper, which is undefined in ESM) and the duplicate
+ * `relativePosix2()` + `relPosix` alias.
+ * This is the single ESM-safe helper used by #loadModule,
+ * #renderToHtmlAsync and the rewrittenPath calculation.
+ * #getPathRelativeToClientDir uses the same primitives directly because it
+ * needs the raw (non-POSIX) result for its boundary checks.
  *
  * @param {string} from The base path
  * @param {string} to The target path
  * @returns {string} The POSIX-normalized relative path
  */
-function relativePosix(from, to) {
-	return toPosixPath(require('node:path').relative(from, to))
-}
-// Use ESM-safe import for pathUtil since the file uses ESM.
-// (Rewritten below once pathUtil is imported.)
-import * as fs from 'node:fs/promises'
-import * as pathUtil from 'node:path'
-import { pipeline } from 'node:stream/promises'
-/**
- * POSIX-normalizing wrapper around `pathUtil.relative`.
- * @param {string} from The base path
- * @param {string} to The target path
- * @returns {string} The POSIX-normalized relative path
- */
-function relativePosix2(from, to) {
+function relPosix(from, to) {
 	return toPosixPath(pathUtil.relative(from, to))
 }
-// Alias for consistency (BUG 3 fix).
-const relPosix = relativePosix2
 /**
  * Iterator that splits a string by a separator.
  * @param {string} str The string to split
@@ -252,7 +260,15 @@ class ClientManager {
 	/**
 	 * @type {Wunphile}
 	 */
-	#ssg
+	// REFACTOR: Legacy `SSG`-based naming replaced with the canonical Wunphile name.
+	#wunphile
+	/**
+	 * Resolves the current project root path.
+	 * @type {() => string}
+	 */
+	// FIX #10: A getter rather than a snapshot, so overrideRootPath() and
+	// worker-mode root paths are honored when modules are actually loaded.
+	#getProjectRootPath
 	/**
 	 * The path to the client directory.
 	 * Absolute path.
@@ -280,12 +296,17 @@ class ClientManager {
 	#loadingModules = /** @type {Set<Promise<any>>} */ (new Set())
 	/**
 	 * Creates a new client manager.
-	 * @param {Wunphile} ssg The Wunphile instance
+	 * @param {Wunphile} wunphile The Wunphile instance
 	 * @param {string} rootPath The path to the client directory
+	 * @param {() => string} getProjectRootPath Resolves the Wunphile project root path
 	 */
-	constructor(ssg, rootPath) {
-		this.#ssg = ssg
+	// REFACTOR: Constructor parameter renamed to `wunphile` (name only, no behavior change).
+	// FIX #10: The manager needs the project root (not the CWD) to express
+	// static file sources as project-relative paths.
+	constructor(wunphile, rootPath, getProjectRootPath) {
+		this.#wunphile = wunphile
 		this.rootPath = pathUtil.resolve(rootPath)
+		this.#getProjectRootPath = getProjectRootPath
 	}
 	/**
 	 * Returns the path relative to the client directory in POSIX style, or null if it is outside the client directory.
@@ -293,16 +314,29 @@ class ClientManager {
 	 * BUG 3 FIX: The result is normalized to forward slashes so it can be used
 	 * as a URL segment or a Map key that is consistent across platforms.
 	 *
+	 * FIX #6: The old `res.startsWith('..')` check both accepted Windows
+	 * cross-drive paths (pathUtil.relative returns an absolute path there)
+	 * and rejected legitimate filenames such as `..foo.js`.
+	 *
 	 * @param {string} path The path to check
 	 * @returns {string | null} The POSIX-relative path or null if outside the client dir
 	 */
 	#getPathRelativeToClientDir(path) {
-		const res = relPosix(this.rootPath, path)
-		if (res.startsWith('..')) {
+		// FIX #6: Use the raw (non-POSIX) relative result so the boundary
+		// checks see the platform separator, then normalize for URLs.
+		const raw = pathUtil.relative(this.rootPath, path)
+		// FIX #6: Assumption - raw === '' means the path is the client
+		// directory itself, which is not a valid module path, so it is
+		// rejected just like a path outside the client directory.
+		if (
+			raw === '' ||
+			raw === '..' ||
+			raw.startsWith('..' + pathUtil.sep) ||
+			pathUtil.isAbsolute(raw)
+		) {
 			return null
-		} else {
-			return './' + res
 		}
+		return './' + toPosixPath(raw)
 	}
 	/**
 	 * Loads a module.
@@ -326,12 +360,13 @@ class ClientManager {
 			}
 			const relativePath = relPosix(this.rootPath, modPath)
 			this.loadedModules.set(relativePath, { type: 'plain' })
-			this.#ssg.staticFile(
+			// FIX #10: staticFile() resolves its source via toProjectPath()
+			// (relative to the Wunphile root). pathUtil.relative('./', ...)
+			// was relative to the CWD and produced a wrong path whenever
+			// CWD !== project root.
+			this.#wunphile.staticFile(
 				CLIENT_MOUNT_PREFIX + relativePath,
-				pathUtil.relative(
-					'./',
-					pathUtil.join(this.rootPath, relativePath),
-				),
+				pathUtil.relative(this.#getProjectRootPath(), modPath),
 			)
 			return
 		}
@@ -433,7 +468,10 @@ class ClientManager {
 			}
 			// Load all imports asynchronously.
 			for (const { fullImportPath } of imports) {
-				const promise = import(fullImportPath)
+				// FIX #2: fullImportPath is an absolute filesystem path; on
+				// Windows dynamic import() would parse "D:" as a URL scheme
+				// and throw ERR_UNSUPPORTED_ESM_URL_SCHEME.
+				const promise = import(pathToFileURL(fullImportPath).href)
 				this.#loadingModules.add(promise)
 				promise
 					.then((mod) => this.#loadModule(mod, fullImportPath))
@@ -501,7 +539,7 @@ class ClientManager {
 				rewrittenContent: out,
 				rewrittenPath,
 			})
-			this.#ssg.pageRaw(CLIENT_MOUNT_PREFIX + rewrittenPath, out)
+			this.#wunphile.pageRaw(CLIENT_MOUNT_PREFIX + rewrittenPath, out)
 		})()
 		this.#processingModules.set(loadedModKey, loaderProm)
 		await loaderProm
@@ -515,24 +553,34 @@ class ClientManager {
 	 * @param {Promise<any>} promise The promise from the `import()` call for the behavior module
 	 */
 	loadBehaviorModule(promise) {
-		this.#loadingModules.add(promise)
-		// Don't bother catching errors, let it crash if it fails.
-		promise
-			.then((mod) => this.#loadModule(mod, null))
-			.finally(() => this.#loadingModules.delete(promise))
+		// FIX #5: Track the whole chain (import + #loadModule processing),
+		// not just the raw import promise, so waitForModules() observes both
+		// import failures and processing failures instead of leaving a
+		// derived promise as an unhandled rejection.
+		const loaded = promise.then((mod) => this.#loadModule(mod, null))
+		this.#loadingModules.add(loaded)
+		loaded.then(
+			() => this.#loadingModules.delete(loaded),
+			() => this.#loadingModules.delete(loaded),
+		)
 	}
 	/**
 	 * Waits for all modules to load.
+	 * Rejects with the first module load error instead of silently swallowing it.
 	 * @returns {Promise<void>}
 	 */
 	async waitForModules() {
-		// IMPROVEMENT (issue #8): Snapshot the current set of pending promises
-		// and await them all together, instead of busy-looping with setImmediate.
-		// New promises added by awaited ones are handled by recursing once.
+		// FIX #5: Promise.allSettled() prevents an unhandled rejection, but
+		// discarding its results hid every load failure. Re-throw the first
+		// reason. The while loop still handles imports spawned while loading.
 		while (this.#loadingModules.size > 0) {
 			const pending = [...this.#loadingModules]
-			await Promise.allSettled(pending)
-			// Loop again in case awaiting these spawned more imports.
+			const results = await Promise.allSettled(pending)
+			for (const r of results) {
+				if (r.status === 'rejected') {
+					throw r.reason
+				}
+			}
 		}
 	}
 	/**
@@ -573,9 +621,9 @@ function hydrate(mod, path) {
             while ((nextNode = treeWalker.nextNode())) {
                 if (nextNode.nodeType === Node.ELEMENT_NODE) {
                     elem = nextNode
-                    break
+                    break												break
                 }
-            }
+                }
             
             if (elem) {
                 mod.behavior(elem)
@@ -595,6 +643,8 @@ function hydrate(mod, path) {
 		return hydrateScript + '\n' + stmts.join(';\n')
 	}
 }
+// REFACTOR: Class documentation and examples use the canonical
+// `wunphile` name. `SSG` is only a legacy alias exported further down.
 /**
  * The main class for the Wunphile library.
  *
@@ -603,11 +653,11 @@ function hydrate(mod, path) {
  * import { Wunphile } from 'wunphile'
  * import { IndexPage } from './components/Greeting.js'
  *
- * const ssg = new Wunphile(import.meta.url)
+ * const wunphile = new Wunphile(import.meta.url)
  *
- * ssg.page('/index.html', IndexPage)
+ * wunphile.page('/index.html', IndexPage)
  *
- * await ssg.cli()
+ * await wunphile.cli()
  * ```
  */
 export class Wunphile {
@@ -645,6 +695,13 @@ export class Wunphile {
 	 */
 	#sitemapPath = null
 	/**
+	 * URL-style paths registered through redirect(); excluded from the sitemap.
+	 * @type {Set<string>}
+	 */
+	// FIX #8: redirect() registers through page(), so the sitemap needs an
+	// explicit record to tell redirect pages apart from real pages.
+	#redirectPaths = new Set()
+	/**
 	 * @type {Map<string, Component<void, void>>}
 	 */
 	#pageMapping = new Map()
@@ -665,6 +722,7 @@ export class Wunphile {
 	 * @type {number}
 	 */
 	#lastReload = -1
+	// REFACTOR: Example below uses the canonical `wunphile` name.
 	/**
 	 * Preloads a behavior module.
 	 * The loading is done asynchronously, similarly to using an HTML `<link rel="modulepreload">` tag.
@@ -672,13 +730,14 @@ export class Wunphile {
 	 *
 	 * @example
 	 * ```js
-	 * ssg.preloadBehaviorModule(import('./client/behavior/Greeting.js'))
+	 * wunphile.preloadBehaviorModule(import('./client/behavior/Greeting.js'))
 	 * ```
 	 * @param {Promise<{ default: BehaviorModule }>} promise The promise from the `import()` call for the behavior module
 	 */
 	preloadBehaviorModule(promise) {
 		this.#clientManager.loadBehaviorModule(promise)
 	}
+	// REFACTOR: Constructor example uses the canonical `wunphile` name.
 	/**
 	 * Creates a new Wunphile instance.
 	 *
@@ -687,11 +746,11 @@ export class Wunphile {
 	 * import { Wunphile } from 'wunphile'
 	 * import { IndexPage } from './components/Greeting.js'
 	 *
-	 * const ssg = new Wunphile(import.meta.url)
+	 * const wunphile = new Wunphile(import.meta.url)
 	 *
-	 * ssg.page('/index.html', IndexPage)
+	 * wunphile.page('/index.html', IndexPage)
 	 *
-	 * await ssg.cli()
+	 * await wunphile.cli()
 	 * ```
 	 *
 	 * @param {string} importMetaUrl The `import.meta.url` of the program main module.
@@ -701,9 +760,12 @@ export class Wunphile {
 	 */
 	constructor(importMetaUrl, clientDir = './src/client') {
 		const mainModulePath = fileURLToPath(importMetaUrl)
+		// FIX #10: Supply the project root resolver; #rootPath is assigned
+		// just below, so a lazy getter is used instead of a snapshot.
 		this.#clientManager = new ClientManager(
 			this,
 			pathUtil.join(pathUtil.dirname(mainModulePath), clientDir),
+			() => this.#rootPath,
 		)
 		if (isMainThread) {
 			// Resolve paths
@@ -744,8 +806,13 @@ export class Wunphile {
 	}
 	/**
 	 * Enables or disables HTML minification for the build output.
-	 * When enabled, HTML is minified by collapsing runs of whitespace between
-	 * tags and removing HTML comments (excluding conditional comments).
+	 * When enabled, HTML is minified by collapsing whitespace between tags
+	 * and removing HTML comments (excluding conditional comments and
+	 * `wf-behavior:` hydration comments), then trimming the result.
+	 *
+	 * FIX #13: This is a conservative minifier. Text nodes, including runs of
+	 * repeated spaces, are left untouched; <pre>, <textarea>, <script> and
+	 * <style> contents are preserved verbatim.
 	 *
 	 * NEW FEATURE.
 	 *
@@ -877,8 +944,10 @@ export class Wunphile {
 			try {
 				const filename = 'mime-db.json'
 				const vendorPath = pathUtil.join(import.meta.dirname, filename)
+				// FIX #2: vendorPath is also an absolute filesystem path, so it
+				// needs the same file: URL wrapping as #loadModule's imports.
 				mimeDb = (
-					await import(vendorPath, {
+					await import(pathToFileURL(vendorPath).href, {
 						with: { type: 'json' },
 					})
 				).default
@@ -1023,13 +1092,27 @@ export class Wunphile {
 		if (isMainThread) {
 			this.#pageMapping.set(path, component)
 		} else {
-			this.#renderToHtmlAsync(component()).then((content) => {
-				parentPort.postMessage({
-					type: 'pageRaw',
-					path,
-					content,
+			// FIX #12: Without a rejection handler, a failed render became an
+			// unhandled rejection inside the worker and the main thread kept
+			// treating the reload as successful. Report it as pageError.
+			this.#renderToHtmlAsync(component())
+				.then((content) => {
+					parentPort.postMessage({
+						type: 'pageRaw',
+						path,
+						content,
+					})
 				})
-			})
+				.catch((err) => {
+					parentPort.postMessage({
+						type: 'pageError',
+						path,
+						error:
+							err instanceof Error
+								? err.stack || err.message
+								: String(err),
+					})
+				})
 		}
 	}
 	/**
@@ -1046,6 +1129,12 @@ export class Wunphile {
 	 * @param {string} url The URL/path to redirect to
 	 */
 	redirect(path, url) {
+		// FIX #8: Remember redirect paths so #buildSitemap() can omit them.
+		this.#redirectPaths.add(path)
+		// FIX #3: Build a single HTML fragment holding the JSON string literal.
+		// JSON.stringify() output is already a valid, escaped JS literal, so
+		// the generated <script> body parses as JavaScript; interpolating an
+		// array of RenderFragments here is never safe.
 		// prettier-ignore
 		this.page(path, () => html`
 <!doctype html>
@@ -1061,7 +1150,7 @@ export class Wunphile {
     <body>
         Redirecting to <a href="${url}">${url}</a>... (click link if nothing happens)
         <meta http-equiv="refresh" content="0; url=${url}" />
-        <script>location.assign(${html(JSON.stringify(url))})</script>
+        <script>location.assign(${new RenderFragment(RenderFragmentType.HTML, JSON.stringify(url))})</script>
     </body>
 </html>
         `)
@@ -1133,10 +1222,14 @@ export class Wunphile {
 	}
 	/**
 	 * Minifies an HTML string.
-	 * Collapses runs of whitespace between tags, removes HTML comments
-	 * (except conditional comments), and trims leading/trailing whitespace.
+	 * Collapses whitespace between tags, removes HTML comments (except
+	 * conditional comments and `wf-behavior:` hydration comments), and trims
+	 * leading/trailing whitespace.
 	 *
 	 * NEW FEATURE. Conservative - does not touch <pre>, <textarea>, <script>, or <style> contents.
+	 *
+	 * FIX #13: Whitespace *inside text nodes* is never collapsed, so inline
+	 * content that depends on repeated spaces is preserved.
 	 *
 	 * @param {string} htmlStr The HTML to minify
 	 * @returns {string} The minified HTML
@@ -1152,11 +1245,14 @@ export class Wunphile {
 		})
 		let out = masked
 			// Remove HTML comments, but preserve conditional comments (<!--[if ...]> ... <![endif]-->).
-			.replace(/<!--(?!\[if)[\s\S]*?-->/g, '')
+			// FIX #4: Also preserve <!--wf-behavior:...--> hydration markers,
+			// otherwise minifyHtml() silently disables every client behavior.
+			.replace(/<!--(?!\[if|wf-behavior:)[\s\S]*?-->/g, '')
 			// Collapse whitespace between tags.
+			// FIX #13: No global /\s{2,}/ -> ' ' pass; it collapsed repeated
+			// spaces inside ordinary text nodes and broke space-sensitive
+			// inline content, contrary to "conservative minify".
 			.replace(/>\s+</g, '><')
-			// Collapse multiple whitespace to single space within text.
-			.replace(/\s{2,}/g, ' ')
 			.trim()
 		// Restore protected blocks.
 		out = out.replace(/\u0000(\d+)\u0000/g, (_, idx) =>
@@ -1177,7 +1273,12 @@ export class Wunphile {
 			return ''
 		}
 		const excludedPrefixes = [CLIENT_MOUNT_PREFIX]
-		const excludePaths = new Set([this.#notFoundPath])
+		// FIX #8: redirect() pages are registered through page(), so they
+		// must be filtered out explicitly along with the not-found page.
+		const excludePaths = new Set([
+			this.#notFoundPath,
+			...this.#redirectPaths,
+		])
 		const entries = []
 		for (const path of this.#pageMapping.keys()) {
 			if (excludedPrefixes.some((p) => path.startsWith(p))) {
@@ -1270,8 +1371,12 @@ export class Wunphile {
 				await fs.mkdir(sitemapDir, { recursive: true })
 			}
 			await fs.writeFile(sitemapOutPath, sitemapContent)
+			// FIX #8: Log the number of URLs actually written, not the number
+			// of registered pages (which also counts client mounts, redirects
+			// and the not-found page). Every entry is emitted as one <url>.
+			const writtenEntries = (sitemapContent.match(/<url>/g) ?? []).length
 			console.log(
-				`Generated sitemap at ${this.#sitemapPath} with ${this.#pageMapping.size} candidate pages`,
+				`Generated sitemap at ${this.#sitemapPath} with ${writtenEntries} URLs`,
 			)
 		}
 	}
@@ -1474,20 +1579,16 @@ if (!window.__wunphile_hotreload) {
 					if (path === staticPath) {
 						const fsPath = this.toProjectPath(filePath)
 						if ((await statOrNull(fsPath)) !== null) {
+							// FIX #11: Use pipeline() exactly like the static
+							// directory branch. pipe() already ends the
+							// response, so the extra res.end() inside the
+							// promise could raise ERR_STREAM_WRITE_AFTER_END.
 							await using file = await fs.open(fsPath, 'r')
+							res.writeHead(200, { 'Content-Type': mime })
 							try {
-								const readStream = file.createReadStream()
-								res.writeHead(200, { 'Content-Type': mime })
-								await new Promise((promRes, rej) => {
-									readStream
-										.pipe(res)
-										.on('close', promRes)
-										.on('error', rej)
-								})
-								res.end()
-							} finally {
-								await file.close()
-							}
+								await pipeline(file.createReadStream(), res)
+							} catch {}
+							res.end()
 							return true
 						}
 					}
@@ -1579,18 +1680,22 @@ Environment variables:
 				const oldFs = await import('node:fs')
 				oldFs.watch(
 					this.#rootPath,
-					{
-						recursive: true,
-						persistent: true,
-						// IMPROVEMENT: Skip the output dir to avoid reload loops
-						// when Wunphile itself writes to disk.
-						ignored: (filepath) => {
-							return pathUtil
-								.resolve(filepath)
-								.startsWith(this.#outputPath)
-						},
-					},
-					async () => {
+					// FIX #7: fs.watch has no `ignored` option (that is a chokidar
+					// API); it was silently ignored, so output writes caused
+					// hot-reload loops. Filter in the callback instead.
+					{ recursive: true, persistent: true },
+					async (_eventType, filename) => {
+						// FIX #7: A null filename means the platform did not report
+						// one, so conservatively allow the reload in that case.
+						if (filename != null) {
+							const full = pathUtil.resolve(
+								this.#rootPath,
+								String(filename),
+							)
+							if (full.startsWith(this.#outputPath)) {
+								return
+							}
+						}
 						if (hasPendingReload) {
 							return
 						}
@@ -1638,7 +1743,18 @@ Environment variables:
 													msg.file,
 												)
 												break
-										}
+											// FIX #12: Merge worker-side render
+											// failures into the existing gotError
+											// path, so the old mapping is kept and
+											// reload is still emitted only once.
+											case 'pageError':
+												gotError = true
+												lastError = new Error(String(msg.error))
+												console.error(
+													`Error while rendering page "${msg.path}":\n${msg.error}`,
+												)
+												break
+											}
 									}
 								),
 							)
@@ -1696,6 +1812,18 @@ export const RenderFragmentType = {
 	BEHAVIOR_MODULE: 2,
 	BEHAVIOR_MODULE_LOADER: 3,
 }
+// REFACTOR: Public compatibility alias; must be the exact same class object.
+/**
+ * Backward-compatible alias for the Wunphile class.
+ *
+ * `SSG` is the legacy name kept so that existing code importing it
+ * continues to work. It refers to exactly the same class as {@link Wunphile}.
+ * New code must use `Wunphile` directly; this alias is deprecated and may be
+ * removed in a future major release.
+ *
+ * @type {typeof Wunphile}
+ */
+export const SSG = Wunphile
 /**
  * A render fragment is a string that can be rendered to HTML.
  */
@@ -1734,6 +1862,30 @@ export class RenderFragment {
 		this.type = type
 		this.value = value
 		this.behaviorModulePromise = behaviorModulePromise
+	}
+	// FIX #1: Restore the missing instance method. #renderToHtmlAsync() and
+	// renderToHtml() both call fragment.toHtml(), so without it every page
+	// render throws `TypeError: fragment.toHtml is not a function`.
+	/**
+	 * Renders the fragment to HTML.
+	 * @returns {string}
+	 */
+	toHtml() {
+		switch (this.type) {
+			case RenderFragmentType.TEXT:
+				return sanitizeHtml(this.value)
+			case RenderFragmentType.HTML:
+				return this.value
+			case RenderFragmentType.BEHAVIOR_MODULE:
+			case RenderFragmentType.BEHAVIOR_MODULE_LOADER:
+				// Behavior modules are not rendered to HTML.
+				// The loader is injected separately by #renderToHtmlAsync.
+				return ''
+			default:
+				throw new Error(
+					`Unknown fragment type: ${this.type}. Valid types are contained in the RenderFragmentType enum.`,
+				)
+		}
 	}
 }
 /**
