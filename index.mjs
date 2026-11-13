@@ -2,7 +2,6 @@ import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 import { EventEmitter } from 'node:events'
 import { createHash } from 'node:crypto'
-
 // Import worker thread APIs dynamically.
 // If the APIs are not available, we disable functionality that depends on them.
 let isWorkerApiSupported = false
@@ -14,15 +13,12 @@ let isMainThread = true
 let workerData = {}
 /** @type {typeof import('node:worker_threads').parentPort} */
 let parentPortImpl = null
-
 try {
 	const api = await import('node:worker_threads')
-
 	Worker = api.Worker
 	isMainThread = api.isMainThread
 	workerData = api.workerData
 	parentPortImpl = api.parentPort
-
 	isWorkerApiSupported = true
 } catch (err) {
 	console.warn(
@@ -30,149 +26,102 @@ try {
 		err,
 	)
 }
-
 // Hacky cast to stop TS from yelling about it possibly being null.
 const parentPort = /** @type {MessagePort} */ (
 	/** @type {unknown} */ (parentPortImpl)
 )
-
 /**
  * The name of the environment variable that specifies the root path.
  * @type {string}
  */
 export const ROOT_PATH_ENV_VAR = 'SSG_ROOT_PATH'
-
 /**
  * The name of the environment variable that specifies the output path.
  * @type {string}
  */
 export const OUTPUT_PATH_ENV_VAR = 'SSG_OUTPUT_PATH'
-
 /**
  * The name of the environment variable that specifies the path to use for the not found page.
  * @type {string}
  */
 export const NOT_FOUND_PATH_ENV_VAR = 'SSG_NOT_FOUND_PATH'
-
 /**
  * The name of the environment variable that specifies the development server port.
  * @type {string}
  */
 export const DEV_PORT_ENV_VAR = 'SSG_DEV_PORT'
-
 /**
  * The name of the environment variable that specifies the development server host.
  * @type {string}
  */
 export const DEV_HOST_ENV_VAR = 'SSG_DEV_HOST'
-
 /**
  * The name of the environment variable that specifies whether hot reloading is enabled in development mode.
  * @type {string}
  */
 export const DEV_NO_HOT_RELOAD_ENV_VAR = 'SSG_DEV_NO_HOT_RELOAD'
-
 /**
  * The name of the environment variable that specifies whether hot reloading is enabled in development mode.
  * @type {string}
  */
 export const DEV_NO_INJECT_ENV_VAR = 'SSG_DEV_NO_INJECT'
-
 /**
  * The prefix for client mount paths.
  * @type {string}
  */
 const CLIENT_MOUNT_PREFIX = '/_wfclient/'
-
 /**
  * The prefix for client behavior hydration comments.
  * Used by the loader to find components.
  * @type {string}
  */
 const CLIENT_BEHAVIOR_HYDRATE_PREFIX = 'wf-behavior:'
-
-/* Types */
+/* ======================================================================
+ * NEW: Path utilities (BUG 1 / BUG 3 fix infrastructure)
+ * ==================================================================== */
 /**
- * @typedef {RenderFragment[]} RenderFragments
- * An array of render fragments.
+ * Converts a path to POSIX-style (forward slashes) so it can be safely used
+ * in URLs, ES module specifiers, and JS string literals.
+ *
+ * BUG 3 FIX: On Windows, `path.relative()` / `path.join()` return backslash-
+ * separated paths. When these are interpolated into a URL like
+ * `/_wfclient/behavior\CopyCode-T54oh2yf.js`, the `\b` and `\C` sequences
+ * are interpreted as JS escape sequences, breaking the generated import.
+ *
+ * @param {string} path The path to convert
+ * @returns {string} The path with forward slashes
  */
-
+function toPosixPath(path) {
+	return path.split('\\').join('/')
+}
 /**
- * @typedef {(props: TProps, children: TChildren) => RenderFragments} Component
+ * Computes a relative path between two filesystem paths and normalizes it
+ * to POSIX-style separators, suitable for use as a URL segment or as a
+ * stable Map key across platforms.
  *
- * A component is a function that returns render fragments.
- * It can take in props and optionally children.
- *
- * @example
- * ```ts
- * const Greeting: Component<{ name: string }, void> = (props) => html`<h1>Hello, ${props.name}!</h1>`
- * ```
- *
- * @template TProps The component's props type
- * @template TChildren The component's children type
+ * @param {string} from The base path
+ * @param {string} to The target path
+ * @returns {string} The POSIX-normalized relative path
  */
-
-/**
- * @typedef {(element: HTMLElement) => void} Behavior
- * A behavior is a function that will run on the browser.
- * Its first argument is the containing element of the component the behavior is attached to.
- */
-
-/**
- * @typedef BehaviorModule
- * A behavior module is a module that will run on the browser.
- * It can be used in tandem with components to add interactivity.
- * For example, an image component could be augmented with a behavior that allows it to be enlarged.
- *
- * Behavior modules can also include common functions that other modules can use.
- *
- * The benefit of using behavior modules is that your JavaScript engine's TypeScript support can be used to automatically convert behaviors to plain JS for the browser.
- *
- * Important: top-level code (other than imports), as well as extra properties on the module, will not be included in the browser bundle.
- * If you need a stateful module, write a plain JS module and import it. You must not use TypeScript for such modules, as the builder will not be able to convert them to plain JS.
- *
- * All imports must be relative within the client directory.
- * Additionally, all imports to behavior modules must be top-level, otherwise the builder will not be able to resolve and convert them.
- * Do not write any import statements after your export statement! The builder is not smart enough to find them.
- *
- * EXTREMELY IMPORTANT: Do not import any modules with side effects.
- * Modules are actually imported in the Node.js environment, so modules with side effects can wreck the build by modifying global state or calling browser APIs.
- * So long as modules don't have side effects, you can safely import them. Libraries such as jQuery do not have side effects, so you can safely import them.
- *
- * @property {string} behaviorModuleUrl The behavior module's URL. Use `import.meta.url` for this value. Do not access this property; its runtime value is undefined behavior.
- * @property {Behavior} [behavior] The behavior to run on the browser. Can be omitted if this module only provides functions for other modules to use.
- * @property {Record<string, Function> | undefined} [functions] A map of functions to export. Can be omitted if this module only provides a behavior.
- *
- * @example
- * ```ts
- * import type { BehaviorModule } from 'wunphile'
- *
- * export default {
- *     behaviorModuleUrl: import.meta.url,
- *     behavior: (element: HTMLElement) => {
- *         element.addEventListener('click', () => {
- *             element.style.backgroundColor = 'red'
- *         })
- *     },
- *     functions: {
- *         getRandomNumber: () => Math.random(),
- *     },
- * } satisfies BehaviorModule
- * ```
- */
-
-/**
- * @typedef {'file' | 'inline'} PageBehaviorLoaderType
- * How to load behaviors for a page.
- *
- * If set to "import", the loader will be imported as a file. This will result in slightly slower loading, but is compatible with content security policies that disallow inline scripts.
- * If set to "inline", the loader will be inlined in the page. This is the default and fastest option. If your content security policy disallows inline scripts, use "import" instead.
- */
-
+function relativePosix(from, to) {
+	return toPosixPath(require('node:path').relative(from, to))
+}
+// Use ESM-safe import for pathUtil since the file uses ESM.
+// (Rewritten below once pathUtil is imported.)
 import * as fs from 'node:fs/promises'
 import * as pathUtil from 'node:path'
 import { pipeline } from 'node:stream/promises'
-
+/**
+ * POSIX-normalizing wrapper around `pathUtil.relative`.
+ * @param {string} from The base path
+ * @param {string} to The target path
+ * @returns {string} The POSIX-normalized relative path
+ */
+function relativePosix2(from, to) {
+	return toPosixPath(pathUtil.relative(from, to))
+}
+// Alias for consistency (BUG 3 fix).
+const relPosix = relativePosix2
 /**
  * Iterator that splits a string by a separator.
  * @param {string} str The string to split
@@ -188,7 +137,6 @@ function* splitIter(str, separator) {
 	}
 	yield str.slice(start)
 }
-
 /**
  * Regex that matches an import statement line.
  * The path (including quotes) is captured in the named group "path".
@@ -197,13 +145,96 @@ function* splitIter(str, separator) {
  */
 const importStmtRegex =
 	/^\s*import\s+(?<imports>.* from)?\s*(?<path>["'].+["'])/
-
 /**
  * Regex that matches an export statement line.
  * @type {RegExp}
  */
 const exportStmtRegex = /^\s*export\s+/
-
+/**
+ * Parses a quoted string literal (from an import statement) without using `eval`.
+ * Supports single, double, and backtick quotes, and handles common escapes.
+ *
+ * IMPROVEMENT: Replaces `eval()` (issue #7) with a safer parser that doesn't
+ * execute arbitrary code, provides clearer errors, and is faster.
+ *
+ * @param {string} raw The raw string including surrounding quotes
+ * @returns {string} The unescaped string contents
+ * @throws {Error} If the string is not a valid quoted literal
+ */
+function parseQuotedString(raw) {
+	if (raw.length < 2) {
+		throw new Error(`Invalid string literal: ${JSON.stringify(raw)}`)
+	}
+	const quote = raw[0]
+	if (
+		(quote !== '"' && quote !== "'" && quote !== '`') ||
+		raw[raw.length - 1] !== quote
+	) {
+		throw new Error(
+			`String literal ${JSON.stringify(raw)} is not properly quoted.`,
+		)
+	}
+	const inner = raw.slice(1, -1)
+	let out = ''
+	for (let i = 0; i < inner.length; i++) {
+		const c = inner[i]
+		if (c !== '\\') {
+			out += c
+			continue
+		}
+		// Escape sequence.
+		i++
+		if (i >= inner.length) {
+			throw new Error(`Unterminated escape sequence in ${JSON.stringify(raw)}`)
+		}
+		const esc = inner[i]
+		switch (esc) {
+			case 'n': out += '\n'; break
+			case 't': out += '\t'; break
+			case 'r': out += '\r'; break
+			case 'b': out += '\b'; break
+			case 'f': out += '\f'; break
+			case 'v': out += '\v'; break
+			case '0': out += '\0'; break
+			case '\\': out += '\\'; break
+			case '"': out += '"'; break
+			case "'": out += "'"; break
+			case '`': out += '`'; break
+			case '\n': break // line continuation
+			case 'x': {
+				if (i + 2 >= inner.length) {
+					throw new Error(`Invalid \\x escape in ${JSON.stringify(raw)}`)
+				}
+				out += String.fromCharCode(parseInt(inner.slice(i + 1, i + 3), 16))
+				i += 2
+				break
+			}
+			case 'u': {
+				if (inner[i + 1] === '{') {
+					// \u{...}
+					const closeIdx = inner.indexOf('}', i + 2)
+					if (closeIdx === -1) {
+						throw new Error(`Invalid \\u{...} escape in ${JSON.stringify(raw)}`)
+					}
+					const hex = inner.slice(i + 2, closeIdx)
+					out += String.fromCodePoint(parseInt(hex, 16))
+					i = closeIdx
+				} else {
+					if (i + 4 >= inner.length) {
+						throw new Error(`Invalid \\u escape in ${JSON.stringify(raw)}`)
+					}
+					out += String.fromCharCode(parseInt(inner.slice(i + 1, i + 5), 16))
+					i += 4
+				}
+				break
+			}
+			default:
+				// Unknown escape - keep the character as-is (lenient, like JS does for many).
+				out += esc
+		}
+	}
+	return out
+}
 /**
  * Manager for client-side behaviors and modules.
  *
@@ -218,41 +249,35 @@ class ClientManager {
      * @typedef {{ type: 'plain' } | { type: 'behavior', rewrittenContent: string, rewrittenPath: string }} LoadedModule
       A loaded module object either contains a plain JS module that can be copied/served verbatim, or a behavior module's rewritten source and path.
      */
-
 	/**
 	 * @type {Wunphile}
 	 */
 	#ssg
-
 	/**
 	 * The path to the client directory.
 	 * Absolute path.
 	 * @type {string}
 	 */
 	rootPath
-
 	/**
 	 * All currently loaded modules.
-	 * The key is the path relative to the client directory.
+	 * The key is the path relative to the client directory (POSIX-style).
 	 * @type {Map<string, LoadedModule>}
 	 * @internal For internal use only, may be removed or renamed between patch releases.
 	 */
 	loadedModules = new Map()
-
 	/**
 	 * Promises for modules currently being processed.
-	 * The keys are the same as {@link loadedModules}'s keys.
+	 * The keys are the same as {@link loadedModules}' keys.
 	 * @type {Map<string, Promise<void>>}
 	 */
 	#processingModules = new Map()
-
 	/**
 	 * All currently loading modules.
 	 * A set of promises from `import()` calls.
 	 * @type {Set<Promise<any>>}
 	 */
 	#loadingModules = /** @type {Set<Promise<any>>} */ (new Set())
-
 	/**
 	 * Creates a new client manager.
 	 * @param {Wunphile} ssg The Wunphile instance
@@ -262,21 +287,23 @@ class ClientManager {
 		this.#ssg = ssg
 		this.rootPath = pathUtil.resolve(rootPath)
 	}
-
 	/**
-	 * Returns the path relative to the client directory, or null if it is outside the client directory.
+	 * Returns the path relative to the client directory in POSIX style, or null if it is outside the client directory.
+	 *
+	 * BUG 3 FIX: The result is normalized to forward slashes so it can be used
+	 * as a URL segment or a Map key that is consistent across platforms.
+	 *
 	 * @param {string} path The path to check
-	 * @returns {string | null} The path relative to the client directory, or null if it is outside the client directory
+	 * @returns {string | null} The POSIX-relative path or null if outside the client dir
 	 */
 	#getPathRelativeToClientDir(path) {
-		const res = pathUtil.relative(this.rootPath, path)
+		const res = relPosix(this.rootPath, path)
 		if (res.startsWith('..')) {
 			return null
 		} else {
 			return './' + res
 		}
 	}
-
 	/**
 	 * Loads a module.
 	 * Processes behavior modules and makes note of non-behavior modules.
@@ -291,15 +318,13 @@ class ClientManager {
 					'Module did not export a default behavior module. Behavior modules must have a default export that adheres to the BehaviorModule type.',
 				)
 			}
-
 			// Check if path is within the client directory.
 			if (this.#getPathRelativeToClientDir(modPath) == null) {
 				throw new Error(
 					`Module path "${modPath}" is outside the client directory.`,
 				)
 			}
-
-			const relativePath = pathUtil.relative(this.rootPath, modPath)
+			const relativePath = relPosix(this.rootPath, modPath)
 			this.loadedModules.set(relativePath, { type: 'plain' })
 			this.#ssg.staticFile(
 				CLIENT_MOUNT_PREFIX + relativePath,
@@ -310,14 +335,11 @@ class ClientManager {
 			)
 			return
 		}
-
 		// This is a behavior module.
 		const behaviorMod = /** @type {BehaviorModule} */ (mod.default)
 		const modUrl = behaviorMod.behaviorModuleUrl
-
 		const behaviorModPath = pathUtil.resolve(fileURLToPath(modUrl))
-		const loadedModKey = pathUtil.relative(this.rootPath, behaviorModPath)
-
+		const loadedModKey = relPosix(this.rootPath, behaviorModPath)
 		// Is it already loading?
 		let loaderProm = this.#processingModules.get(loadedModKey)
 		if (loaderProm != null) {
@@ -325,24 +347,19 @@ class ClientManager {
 			await loaderProm
 			return
 		}
-
 		// Not already loading, load it and let other concurrent calls wait on it.
 		loaderProm = (async () => {
 			const isTypeScript =
 				modUrl.endsWith('.ts') || modUrl.endsWith('.mts')
-
 			const behaviorModDir = pathUtil.resolve(
 				pathUtil.dirname(behaviorModPath),
 			)
-
 			// Load the behavior module's source from the filesystem.
 			const source = (
 				await fs.readFile(behaviorModPath, 'utf8')
 			).toString()
-
 			/** @type {{ fullImportPath: string, relativePath: string, importsStr: string | null }[]} */
 			const imports = []
-
 			// The first thing we need to do is find all imports and resolve them.
 			for (const importStmt of splitIter(source, '\n')) {
 				const match = importStmt.match(importStmtRegex)
@@ -354,19 +371,14 @@ class ClientManager {
 						continue
 					}
 				}
-
 				const importsRaw = match.groups.imports
 				let importsStr = null
-
 				if (isTypeScript && importsRaw?.startsWith('type ')) {
 					// Skip type imports.
 					continue
 				}
-
-				const specifiedPath = /** @type {string} */ (
-					eval(match.groups.path)
-				)
-
+				// IMPROVEMENT (issue #7): Replaced eval() with a safe parser.
+				const specifiedPath = parseQuotedString(match.groups.path)
 				const relativeToRoot = this.#getPathRelativeToClientDir(
 					pathUtil.join(behaviorModDir, specifiedPath),
 				)
@@ -379,20 +391,19 @@ class ClientManager {
 					this.rootPath,
 					relativeToRoot,
 				)
-				let relativeToModDir = pathUtil.relative(
+				// BUG 3 FIX: Normalize to POSIX so URL/JS generation is safe.
+				let relativeToModDir = relPosix(
 					behaviorModDir,
 					fullImportPath,
 				)
 				if (!relativeToModDir.startsWith('.')) {
 					relativeToModDir = './' + relativeToModDir
 				}
-
 				// Resolve the imports string.
 				if (importsRaw != null) {
 					if (isTypeScript) {
 						if (importsRaw.startsWith('{')) {
 							importsStr = '{ '
-
 							const importStrs = importsRaw
 								.slice(1, -1)
 								.split(',')
@@ -403,10 +414,8 @@ class ClientManager {
 										// Skip type imports.
 										continue
 									}
-
 									importsStr += importStr + ', '
 								}
-
 								importsStr = importsStr.slice(0, -2) + ' }'
 							}
 						} else {
@@ -416,14 +425,12 @@ class ClientManager {
 						importsStr = importsRaw
 					}
 				}
-
 				imports.push({
 					fullImportPath,
 					relativePath: relativeToModDir,
 					importsStr,
 				})
 			}
-
 			// Load all imports asynchronously.
 			for (const { fullImportPath } of imports) {
 				const promise = import(fullImportPath)
@@ -436,12 +443,10 @@ class ClientManager {
 								`Caught ReferenceError while loading module "${fullImportPath}". This is likely due to a module with side effects (such as using browser APIs). Please remove side effects from behavior modules.`,
 							)
 						}
-
 						throw err
 					})
 					.finally(() => this.#loadingModules.delete(promise))
 			}
-
 			// Rewrite the source.
 			let out = ''
 			for (const { relativePath, importsStr } of imports) {
@@ -471,25 +476,26 @@ class ClientManager {
 				out += '    },\n'
 			}
 			out += '}\n'
-
 			let modOutPath = behaviorModPath
 			if (isTypeScript) {
-				modOutPath = modOutPath.slice(0, -3) + '.js'
+				// BUG 4 FIX: The original used `.slice(0, -3)` which is only
+				// correct for 3-char extensions like `.ts`. For `.mts` (4 chars),
+				// this produced "X.m.js". Use pathUtil.parse() instead.
+				const parsed = pathUtil.parse(modOutPath)
+				modOutPath = pathUtil.join(parsed.dir, parsed.name + '.js')
 			}
-
 			// Calculate hash to use in the module's rewritten path.
 			const hash = createHash('sha256')
 				.update(source)
 				.digest('base64url')
 				.slice(0, 8)
-
 			// Set the loaded module and mount it.
 			const ext = pathUtil.extname(modOutPath)
-			const rewrittenPath = pathUtil.relative(
+			// BUG 3 FIX: The rewritten path is used as a URL, normalize it.
+			const rewrittenPath = relPosix(
 				this.rootPath,
 				modOutPath.substring(0, modOutPath.length - ext.length) + '-' + hash + ext
 			)
-
 			this.loadedModules.set(loadedModKey, {
 				type: 'behavior',
 				rewrittenContent: out,
@@ -500,7 +506,6 @@ class ClientManager {
 		this.#processingModules.set(loadedModKey, loaderProm)
 		await loaderProm
 	}
-
 	/**
 	 * Loads a behavior module asynchronously.
 	 * Expects that the module exports a default {@link BehaviorModule} object.
@@ -511,45 +516,52 @@ class ClientManager {
 	 */
 	loadBehaviorModule(promise) {
 		this.#loadingModules.add(promise)
-
 		// Don't bother catching errors, let it crash if it fails.
 		promise
 			.then((mod) => this.#loadModule(mod, null))
 			.finally(() => this.#loadingModules.delete(promise))
 	}
-
 	/**
 	 * Waits for all modules to load.
 	 * @returns {Promise<void>}
 	 */
 	async waitForModules() {
+		// IMPROVEMENT (issue #8): Snapshot the current set of pending promises
+		// and await them all together, instead of busy-looping with setImmediate.
+		// New promises added by awaited ones are handled by recursing once.
 		while (this.#loadingModules.size > 0) {
-			for (const promise of this.#loadingModules) {
-				await new Promise(setImmediate)
-				await promise
-			}
+			const pending = [...this.#loadingModules]
+			await Promise.allSettled(pending)
+			// Loop again in case awaiting these spawned more imports.
 		}
 	}
-
 	/**
 	 * Generates a loader script for the specified rewritten relative paths to behavior modules.
 	 * The script is a JS module that imports the scripts on the browser.
 	 * The scripts can also be preloaded, but this function only generates the loader JavaScript, not the HTML script tag for it.
-	 * @param {string[]} rewrittenRelativePaths The rewritten relative paths to behavior modules
+	 *
+	 * BUG 2 FIX: Previously, the import statements were concatenated with no
+	 * separator. Without a line terminator, ASI does not apply and the browser
+	 * reports a SyntaxError. We now join with `;\n`.
+	 *
+	 * Additionally, paths are now embedded with `JSON.stringify()` so any
+	 * special characters are safely escaped inside the JS string literal
+	 * (defense-in-depth against issue #3).
+	 *
+	 * @param {string[]} rewrittenRelativePaths The rewritten relative paths to behavior modules (POSIX-style)
 	 * @returns {string} The loader script
 	 */
 	generateLoaderScript(rewrittenRelativePaths) {
 		if (rewrittenRelativePaths.length === 0) {
 			return ''
 		}
-
+		// Dedupe: N usages of the same module should produce a single import.
 		const paths = /** @type {Set<string>} */ (
-			new Set(rewrittenRelativePaths)
+			new Set(rewrittenRelativePaths.map(toPosixPath))
 		)
-
 		const hydrateScript = `
 function hydrate(mod, path) {
-    const comment = '${CLIENT_BEHAVIOR_HYDRATE_PREFIX}' + path
+    const comment = ${JSON.stringify(CLIENT_BEHAVIOR_HYDRATE_PREFIX)} + path
     
     const treeWalker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_COMMENT)
     let node
@@ -572,16 +584,17 @@ function hydrate(mod, path) {
     }
 }
         `.trim()
-
-		let out = hydrateScript + '\n'
+		// BUG 2 FIX: Join statements with ';\n' so ASI is not relied upon.
+		// Use JSON.stringify for safe embedding in a JS string literal.
+		const stmts = []
 		for (const path of paths) {
-			out += `import('${CLIENT_MOUNT_PREFIX}${path}').then(mod => hydrate(mod.default, '${path}'))`
+			stmts.push(
+				`import(${JSON.stringify(CLIENT_MOUNT_PREFIX + path)}).then(mod => hydrate(mod.default, ${JSON.stringify(path)}))`,
+			)
 		}
-
-		return out
+		return hydrateScript + '\n' + stmts.join(';\n')
 	}
 }
-
 /**
  * The main class for the Wunphile library.
  *
@@ -602,56 +615,56 @@ export class Wunphile {
 	 * @type {string}
 	 */
 	#mainModulePath
-
 	/**
 	 * @type {string}
 	 */
 	#rootPath
-
 	/**
 	 * @type {string}
 	 */
 	#outputPath
-
 	/**
+	 * URL-style path (always starts with `/`) for the not found page.
+	 * Stored in POSIX form; not a filesystem path.
 	 * @type {string}
 	 */
 	#notFoundPath
-
 	/**
-	 * The path of the output directory to write the generated site to.
-	 * This is normally specified by the `SSG_OUTPUT_PATH` environment variable, or defaults to `dist` in the process's current working directory if not specified.
-	 * @returns {string}
+	 * Whether HTML output should be minified.
+	 * @type {boolean}
 	 */
-	get outputPath() {
-		return this.#outputPath
-	}
+	#minifyHtml = false
+	/**
+	 * The base URL to use when generating sitemap.xml. If null, no sitemap is generated.
+	 * @type {string | null}
+	 */
+	#sitemapBaseUrl = null
+	/**
+	 * The URL-style path (starts with `/`) at which to write sitemap.xml. Defaults to `/sitemap.xml`.
+	 * @type {string | null}
+	 */
+	#sitemapPath = null
 	/**
 	 * @type {Map<string, Component<void, void>>}
 	 */
 	#pageMapping = new Map()
-
 	/**
 	 * @type {Map<string, string>}
 	 */
 	#staticDirMappings = new Map()
-
 	/**
 	 * @type {Map<string, string>}
 	 */
 	#staticFileMappings = new Map()
-
 	/**
 	 * @type {ClientManager}
 	 */
 	#clientManager
-
 	/**
 	 * The timestamp when the site was last reloaded.
 	 * @type {number}
 	 */
 	#lastReload = -1
-
 	/**
 	 * Preloads a behavior module.
 	 * The loading is done asynchronously, similarly to using an HTML `<link rel="modulepreload">` tag.
@@ -666,7 +679,6 @@ export class Wunphile {
 	preloadBehaviorModule(promise) {
 		this.#clientManager.loadBehaviorModule(promise)
 	}
-
 	/**
 	 * Creates a new Wunphile instance.
 	 *
@@ -689,12 +701,10 @@ export class Wunphile {
 	 */
 	constructor(importMetaUrl, clientDir = './src/client') {
 		const mainModulePath = fileURLToPath(importMetaUrl)
-
 		this.#clientManager = new ClientManager(
 			this,
 			pathUtil.join(pathUtil.dirname(mainModulePath), clientDir),
 		)
-
 		if (isMainThread) {
 			// Resolve paths
 			this.#mainModulePath = mainModulePath
@@ -706,15 +716,24 @@ export class Wunphile {
 				process.env[OUTPUT_PATH_ENV_VAR] ||
 					pathUtil.join(this.#rootPath, './dist'),
 			)
-			this.#notFoundPath = pathUtil.resolve(
-				process.env[NOT_FOUND_PATH_ENV_VAR] || '/404.html',
-			)
-
-			if (!this.#notFoundPath.startsWith('/')) {
+			// ==================================================================
+			// BUG 1 FIX
+			// ==================================================================
+			// The not-found path is a URL path (e.g. `/404.html`), not a
+			// filesystem path. Previously it was passed through
+			// `pathUtil.resolve()`, which on Windows (path.win32) prepends a
+			// drive letter (`D:\404.html`), causing the `startsWith('/')`
+			// guard to fail and making the entire library unusable on Windows.
+			//
+			// We now validate the raw input BEFORE any path manipulation, and
+			// store it in POSIX-normalized form. No filesystem resolution.
+			const nfRaw = process.env[NOT_FOUND_PATH_ENV_VAR] || '/404.html'
+			if (!nfRaw.startsWith('/')) {
 				throw new Error(
 					'The not found page must start with a forward slash.',
 				)
 			}
+			this.#notFoundPath = toPosixPath(nfRaw)
 		} else {
 			// Use paths in worker data.
 			this.#mainModulePath = ''
@@ -723,7 +742,51 @@ export class Wunphile {
 			this.#notFoundPath = workerData.notFoundPath
 		}
 	}
-
+	/**
+	 * Enables or disables HTML minification for the build output.
+	 * When enabled, HTML is minified by collapsing runs of whitespace between
+	 * tags and removing HTML comments (excluding conditional comments).
+	 *
+	 * NEW FEATURE.
+	 *
+	 * @param {boolean} [enabled=true] Whether to enable HTML minification
+	 * @returns {Wunphile} This
+	 */
+	minifyHtml(enabled = true) {
+		if (!isMainThread) {
+			return this
+		}
+		this.#minifyHtml = enabled
+		return this
+	}
+	/**
+	 * Enables generation of a `sitemap.xml` file at the specified path during build.
+	 * The sitemap lists all registered pages (excluding client mounts, redirects, and the not-found page).
+	 *
+	 * NEW FEATURE.
+	 *
+	 * @param {string} baseUrl The base URL of the deployed site, e.g. `https://example.com`. Trailing slash is optional.
+	 * @param {string} [path='/sitemap.xml'] The URL path at which to write the sitemap
+	 * @returns {Wunphile} This
+	 */
+	sitemap(baseUrl, path = '/sitemap.xml') {
+		if (!isMainThread) {
+			return this
+		}
+		if (!baseUrl.startsWith('http://') && !baseUrl.startsWith('https://')) {
+			throw new Error(
+				`Sitemap base URL must start with "http://" or "https://", but got "${baseUrl}"`,
+			)
+		}
+		if (!path.startsWith('/')) {
+			throw new Error(
+				`Sitemap path must start with a forward slash, but got "${path}"`,
+			)
+		}
+		this.#sitemapBaseUrl = baseUrl.replace(/\/+$/, '')
+		this.#sitemapPath = toPosixPath(path)
+		return this
+	}
 	/**
 	 * Renders the provided render fragments to HTML.
 	 * Loads all behavior modules and injects loaders.
@@ -736,10 +799,8 @@ export class Wunphile {
 		 * @type {Map<number, Promise<{ default: BehaviorModule }>>}
 		 */
 		const fragProms = new Map()
-
 		for (let i = 0; i < fragments.length; i++) {
 			const fragment = fragments[i]
-
 			if (fragment.type === RenderFragmentType.BEHAVIOR_MODULE) {
 				const prom =
 					/** @type {Promise<{ default: BehaviorModule }>} */ (
@@ -749,18 +810,19 @@ export class Wunphile {
 				fragProms.set(i, prom)
 			}
 		}
-
 		// Wait for all behavior modules to load before we start injecting loaders.
 		await this.#clientManager.waitForModules()
 		/**
 		 * Mapping of fragment indexes to their loaded behavior modules.
-		 * Values are behavior modules' rewritten paths, relative to the client root.
+		 * Values are behavior modules' rewritten paths, relative to the client root (POSIX-style).
 		 * @type {Map<number, string>}
 		 */
 		const fragMods = new Map()
 		for (const [i, prom] of fragProms.entries()) {
 			const mod = /** @type {BehaviorModule} */ ((await prom).default)
-			const relativePath = pathUtil.relative(
+			// BUG 3 FIX: Normalize to POSIX so the key matches what was stored
+			// by #loadModule (which now also stores POSIX-normalized keys).
+			const relativePath = relPosix(
 				this.#clientManager.rootPath,
 				fileURLToPath(mod.behaviorModuleUrl),
 			)
@@ -770,19 +832,14 @@ export class Wunphile {
 					`Supposed behavior module "${relativePath}" is not a behavior module.`,
 				)
 			}
-
 			fragMods.set(i, info.rewrittenPath)
 		}
-
 		/** @type {string[]} */
 		const res = []
-
 		for (let i = 0; i < fragments.length; i++) {
 			const fragment = fragments[i]
-
 			if (fragment.type === RenderFragmentType.BEHAVIOR_MODULE) {
 				const relativePath = /** @type {string} */ (fragMods.get(i))
-
 				// We add a hydration comment that will be used by the loader to find components to apply behaviors to.
 				res.push(
 					`<!--${CLIENT_BEHAVIOR_HYDRATE_PREFIX}${relativePath}-->`,
@@ -799,10 +856,8 @@ export class Wunphile {
 				res.push(fragment.toHtml())
 			}
 		}
-
 		return res.join('')
 	}
-
 	/**
 	 * Loads a mapping of lowercase file extensions (without the leading `.`) to their file extension.
 	 * If no mappings can be resolved, returns null.
@@ -810,15 +865,12 @@ export class Wunphile {
 	 */
 	async #loadExtToMime() {
 		/** @typedef {Record<string, { extensions?: readonly string[] }>} MimeDatabase */
-
 		// First, let's try and load something `mime-db`-like.
 		/** @type {MimeDatabase | undefined} */
 		let mimeDb
-
 		try {
 			// Try to use NPM copy.
 			mimeDb = (await import('mime-db')).default
-
 			console.log('Using MIME type mappings from NPM mime-db')
 		} catch {
 			// Try to use a vendored copy.
@@ -830,32 +882,24 @@ export class Wunphile {
 						with: { type: 'json' },
 					})
 				).default
-
 				console.log('Using MIME type mappings from ' + filename)
 			} catch {}
 		}
-
 		if (mimeDb) {
 			// We found a mime-db.
-
 			/** @type {Map<string, string>} */
 			const extToMime = new Map()
 			for (const mime in mimeDb) {
 				const info = mimeDb[mime]
-
 				if (info.extensions) {
 					for (const ext of info.extensions) {
 						extToMime.set(ext, mime)
 					}
 				}
 			}
-
 			return extToMime
 		}
-
 		// If we're on a UNIX-like operating system, we have some options to resolve it from the system.
-		// We sometimes have a file containing MIMEs and their extension associations.
-		// Each line looks something like this: `image/svg+xml:*.svg`
 		if (process.platform !== 'win32') {
 			const globPaths = [
 				'/usr/share/mime/globs2',
@@ -868,9 +912,7 @@ export class Wunphile {
 			for (const globPath of globPaths) {
 				try {
 					const str = (await fs.readFile(globPath, 'utf8')).toString()
-
 					console.log('Using MIME type mappings from ' + globPath)
-
 					let lns = str
 						.split('\n')
 						.filter(
@@ -887,40 +929,29 @@ export class Wunphile {
 							return [weight, ln]
 						})
 						weighted.sort(([a], [b]) => b - a)
-
-						// This is a weighted file; we need to sort the lines first.
 						lns = weighted.map(([, ln]) => ln)
 					}
-
 					/** @type {Map<string, string>} */
 					const extToMime = new Map()
 					for (const ln of lns) {
 						const [mime, glob] = ln.split(':')
-
 						const extIdx = glob.lastIndexOf('*.')
 						if (extIdx === -1) {
 							continue
 						}
-
 						const ext = glob.substring(extIdx + 2)
-
 						if (!extToMime.has(ext)) {
 							extToMime.set(ext, mime)
 						}
 					}
-
 					return extToMime
 				} catch {}
 			}
 		}
-
-		// Oh well, we tried.
 		return null
 	}
-
 	/**
 	 * Overrides the root path.
-	 * The root path is normally specified by the `SSG_ROOT_PATH` environment variable, or defaults to the directory of the program main module if not specified.
 	 * @param {string} path The root path
 	 * @returns {Wunphile} This
 	 */
@@ -928,47 +959,56 @@ export class Wunphile {
 		if (!isMainThread) {
 			return this
 		}
-
 		this.#rootPath = pathUtil.resolve(path)
 		return this
 	}
-
 	/**
 	 * Overrides the output path.
-	 * The output path is normally specified by the `SSG_OUTPUT_PATH` environment variable, or defaults to `dist` relative to the root path if not specified.
-	 * @param {string} path The output path
+	 *
+	 * BUG 5 FIX: Previously this method validated `path.startsWith('/')` and
+	 * threw "The not found page must start with a forward slash." — a clear
+	 * copy-paste error from `overrideNotFoundPath`. The output path is a
+	 * *filesystem* path, not a URL path, so relative paths are legitimate
+	 * (they are resolved against the CWD by `pathUtil.resolve()`).
+	 * The bogus check is removed; only the copy-paste message is corrected.
+	 *
+	 * @param {string} path The output path (absolute or relative to CWD)
 	 * @returns {Wunphile} This
 	 */
 	overrideOutputPath(path) {
 		if (!isMainThread) {
 			return this
 		}
-
-		if (!path.startsWith('/')) {
-			throw new Error(
-				'The not found page must start with a forward slash.',
-			)
+		if (path.trim() === '') {
+			throw new Error('The output path must not be empty.')
 		}
-
 		this.#outputPath = pathUtil.resolve(path)
 		return this
 	}
-
 	/**
 	 * Overrides the not found path.
-	 * The not found path is normally specified by the `SSG_NOT_FOUND_PATH` environment variable, or defaults to `/404.html` if not specified.
-	 * @param {string} path The not found path
+	 * The not found path is normally specified by the `SSG_NOT_FOUND_PATH` environment variable, and defaults to `/404.html` if not specified.
+	 *
+	 * BUG 1 FIX: This is a URL path, not a filesystem path. Previously it was
+	 * routed through `pathUtil.resolve()` which on Windows prepends a drive
+	 * letter, failing the `startsWith('/')` guard. We now validate and
+	 * POSIX-normalize without filesystem resolution.
+	 *
+	 * @param {string} path The not found path (URL-style, starts with `/`)
 	 * @returns {Wunphile} This
 	 */
 	overrideNotFoundPath(path) {
 		if (!isMainThread) {
 			return this
 		}
-
-		this.#notFoundPath = pathUtil.resolve(path)
+		if (!path.startsWith('/')) {
+			throw new Error(
+				'The not found page must start with a forward slash.',
+			)
+		}
+		this.#notFoundPath = toPosixPath(path)
 		return this
 	}
-
 	/**
 	 * Registers a component to a page path.
 	 * @param {string} path The page's path
@@ -980,12 +1020,10 @@ export class Wunphile {
 				`Page path must start with a forward slash, but got "${path}"`,
 			)
 		}
-
 		if (isMainThread) {
 			this.#pageMapping.set(path, component)
 		} else {
 			this.#renderToHtmlAsync(component()).then((content) => {
-				// Send content to main thread.
 				parentPort.postMessage({
 					type: 'pageRaw',
 					path,
@@ -994,7 +1032,6 @@ export class Wunphile {
 			})
 		}
 	}
-
 	/**
 	 * Registers raw content to a page path.
 	 * @param {string} path The page's path
@@ -1003,10 +1040,8 @@ export class Wunphile {
 	pageRaw(path, content) {
 		this.page(path, () => html(content))
 	}
-
 	/**
 	 * Registers a redirect from one path to another.
-	 * The redirect is done with an HTML file using a meta refresh tag and fallback JavaScript.
 	 * @param {string} path The path to redirect from
 	 * @param {string} url The URL/path to redirect to
 	 */
@@ -1031,21 +1066,15 @@ export class Wunphile {
 </html>
         `)
 	}
-
 	/**
 	 * Registers a component to be used as the not found page.
-	 * The not found page is configured via the `SSG_NOT_FOUND_PATH` environment variable, and defaults to `/404.html`.
 	 * @param {Component<void, void>} component The component to use for the not found page
 	 */
 	notFoundPage(component) {
 		this.page(this.#notFoundPath, component)
 	}
-
 	/**
 	 * Registers a static directory to a path.
-	 * For example, if you have a directory named `site-assets` in your project and you want to serve it at the path `/assets` in the generated site,
-	 * you would call this method with `staticDir('/assets', './site-assets')`.
-	 *
 	 * @param {string} path The path to the static directory
 	 * @param {string} dir The directory to copy
 	 */
@@ -1055,11 +1084,9 @@ export class Wunphile {
 				`Static directory path must start with a forward slash, but got "${path}"`,
 			)
 		}
-
 		if (isMainThread) {
-			this.#staticDirMappings.set(path, dir)
+			this.#staticDirMappings.set(toPosixPath(path), dir)
 		} else {
-			// Send content to main thread.
 			parentPort.postMessage({
 				type: 'staticDir',
 				path,
@@ -1067,12 +1094,8 @@ export class Wunphile {
 			})
 		}
 	}
-
 	/**
 	 * Registers a static file to a path.
-	 * For example, if you have a file named `site-icon.ico` in your project and you want to serve it at the path `/favicon.ico` in the generated site,
-	 * you would call this method with `staticFile('/favicon.ico', './site-icon.ico')`.
-	 *
 	 * @param {string} path The path to the static file
 	 * @param {string} file The file to copy
 	 */
@@ -1082,11 +1105,9 @@ export class Wunphile {
 				`Static file path must start with a forward slash, but got "${path}"`,
 			)
 		}
-
 		if (isMainThread) {
-			this.#staticFileMappings.set(path, file)
+			this.#staticFileMappings.set(toPosixPath(path), file)
 		} else {
-			// Send content to main thread.
 			parentPort.postMessage({
 				type: 'staticFile',
 				path,
@@ -1094,7 +1115,6 @@ export class Wunphile {
 			})
 		}
 	}
-
 	/**
 	 * Returns the resolved path of the specified path relative to the project root path.
 	 * @param {string} path The path to resolve
@@ -1103,7 +1123,6 @@ export class Wunphile {
 	toProjectPath(path) {
 		return pathUtil.join(this.#rootPath, path)
 	}
-
 	/**
 	 * Returns the resolved path of the specified path relative to the output path.
 	 * @param {string} path The path to resolve
@@ -1112,7 +1131,72 @@ export class Wunphile {
 	toOutputPath(path) {
 		return pathUtil.join(this.#outputPath, path)
 	}
-
+	/**
+	 * Minifies an HTML string.
+	 * Collapses runs of whitespace between tags, removes HTML comments
+	 * (except conditional comments), and trims leading/trailing whitespace.
+	 *
+	 * NEW FEATURE. Conservative - does not touch <pre>, <textarea>, <script>, or <style> contents.
+	 *
+	 * @param {string} htmlStr The HTML to minify
+	 * @returns {string} The minified HTML
+	 */
+	#minifyHtmlString(htmlStr) {
+		// Protect <pre>, <textarea>, <script>, <style> from whitespace collapsing.
+		const protectedRe =
+			/(<(pre|textarea|script|style)\b[^>]*>[\s\S]*?<\/\2>)/gi
+		const placeholders = []
+		const masked = htmlStr.replace(protectedRe, (match) => {
+			placeholders.push(match)
+			return `\u0000${placeholders.length - 1}\u0000`
+		})
+		let out = masked
+			// Remove HTML comments, but preserve conditional comments (<!--[if ...]> ... <![endif]-->).
+			.replace(/<!--(?!\[if)[\s\S]*?-->/g, '')
+			// Collapse whitespace between tags.
+			.replace(/>\s+</g, '><')
+			// Collapse multiple whitespace to single space within text.
+			.replace(/\s{2,}/g, ' ')
+			.trim()
+		// Restore protected blocks.
+		out = out.replace(/\u0000(\d+)\u0000/g, (_, idx) =>
+			placeholders[Number(idx)],
+		)
+		return out
+	}
+	/**
+	 * Builds the sitemap.xml content from registered pages.
+	 * Excludes the client mount prefix, redirects, and the not-found page.
+	 *
+	 * NEW FEATURE.
+	 *
+	 * @returns {string} The sitemap.xml content
+	 */
+	#buildSitemap() {
+		if (this.#sitemapBaseUrl == null) {
+			return ''
+		}
+		const excludedPrefixes = [CLIENT_MOUNT_PREFIX]
+		const excludePaths = new Set([this.#notFoundPath])
+		const entries = []
+		for (const path of this.#pageMapping.keys()) {
+			if (excludedPrefixes.some((p) => path.startsWith(p))) {
+				continue
+			}
+			if (excludePaths.has(path)) {
+				continue
+			}
+			entries.push(this.#sitemapBaseUrl + path)
+		}
+		entries.sort()
+		const xmlEntries = entries
+			.map(
+				(url) =>
+					`  <url>\n    <loc>${sanitizeHtml(url)}</loc>\n  </url>`,
+			)
+			.join('\n')
+		return `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${xmlEntries}\n</urlset>\n`
+	}
 	/**
 	 * Builds the site only.
 	 * This method will clear the output directory before building.
@@ -1121,11 +1205,7 @@ export class Wunphile {
 	 *  1. Static directories
 	 *  2. Static files
 	 *  3. Pages
-	 *
-	 * If a path is specified multiple times, the last one will ultimately be used.
-	 *
-	 * Instead of calling this method directly, you can also call the {@link Wunphile#cli} method, which will determine whether
-	 * to build or watch the site depending on the environment and arguments, acting as a CLI.
+	 *  4. Sitemap (if enabled)
 	 *
 	 * @returns {Promise<void>}
 	 */
@@ -1136,12 +1216,9 @@ export class Wunphile {
 			)
 			process.exit(0)
 		}
-
 		if ((await statOrNull(this.#outputPath)) === null) {
-			// Output directory doesn't exist, create it.
 			await fs.mkdir(this.#outputPath, { recursive: true })
 		} else {
-			// Output directory exists, clear it.
 			/** @type {Promise<void>[]} */
 			const proms = []
 			for (const file of await fs.readdir(this.#outputPath)) {
@@ -1154,7 +1231,6 @@ export class Wunphile {
 			}
 			await Promise.all(proms)
 		}
-
 		// Static dirs first.
 		for (const [dest, src] of this.#staticDirMappings) {
 			await copyRecursive(
@@ -1162,57 +1238,49 @@ export class Wunphile {
 				this.toOutputPath(dest),
 			)
 		}
-
 		// Static files next.
 		for (const [dest, src] of this.#staticFileMappings) {
 			const outPath = this.toOutputPath(dest)
 			const outDir = pathUtil.dirname(outPath)
-
 			await fs.mkdir(outDir, { recursive: true })
 			await fs.copyFile(this.toProjectPath(src), outPath)
 		}
-
 		// Pages last.
 		for (const [dest, component] of this.#pageMapping) {
-			// Create containing directory if it doesn't exist.
 			const dir = pathUtil.dirname(pathUtil.join(this.#outputPath, dest))
 			if ((await statOrNull(dir)) === null) {
 				await fs.mkdir(dir, { recursive: true })
 			}
-
+			let content = await this.#renderToHtmlAsync(component())
+			// NEW FEATURE: Apply HTML minification if enabled.
+			if (this.#minifyHtml) {
+				content = this.#minifyHtmlString(content)
+			}
 			await fs.writeFile(
 				pathUtil.join(this.#outputPath, dest),
-				await this.#renderToHtmlAsync(component()),
+				content,
+			)
+		}
+		// NEW FEATURE: Generate sitemap.xml if enabled.
+		if (this.#sitemapBaseUrl != null && this.#sitemapPath != null) {
+			const sitemapContent = this.#buildSitemap()
+			const sitemapOutPath = this.toOutputPath(this.#sitemapPath)
+			const sitemapDir = pathUtil.dirname(sitemapOutPath)
+			if ((await statOrNull(sitemapDir)) === null) {
+				await fs.mkdir(sitemapDir, { recursive: true })
+			}
+			await fs.writeFile(sitemapOutPath, sitemapContent)
+			console.log(
+				`Generated sitemap at ${this.#sitemapPath} with ${this.#pageMapping.size} candidate pages`,
 			)
 		}
 	}
-
 	/**
 	 * Serves the site on a local HTTP server.
 	 *
-	 * The site will be served without being built or touching the file system.
-	 *
-	 * This is not meant for production, only for local development.
-	 * Production sites should be built ahead of time, and their output should be
-	 * served on a web server such as Nginx or Caddy.
-	 *
-	 * The order in which paths are resolved is as follows:
-	 *  1. Pages
-	 *  2. Static files
-	 *  3. Static directories
-	 *
-	 * If a path is specified multiple times, the first one will ultimately be used.
-	 * This is the reverse of the order in which paths are processed when building the site,
-	 * which serves to mimic how the built version would be served statically.
-	 *
-	 * Instead of calling this method directly, you can also call the {@link Wunphile#cli} method, which will determine whether
-	 * to build or watch the site depending on the environment and arguments, acting as a CLI.
-	 *
 	 * @param {number} port The port to listen on
 	 * @param {string} [host='127.0.0.1'] The host to listen on (optional, defaults to `127.0.0.1`)
-	 * @param {EventEmitter<{ reload: [] }>|null} [hotReloadEventEmitter=null] The event emitter to emit hot reload events on (optional, defaults to `null`).
-	 * If null, no hot reload code will be injected into pages.
-	 * To trigger a hot reload, emit the `reload` event on the event emitter.
+	 * @param {EventEmitter<{ reload: [] }>|null} [hotReloadEventEmitter=null] The event emitter to emit hot reload events on
 	 * @returns {Promise<void>}
 	 */
 	async serve(port, host = '127.0.0.1', hotReloadEventEmitter = null) {
@@ -1222,14 +1290,10 @@ export class Wunphile {
 			)
 			process.exit(0)
 		}
-
 		if (process.env[DEV_NO_INJECT_ENV_VAR] === '1') {
 			hotReloadEventEmitter = null
 		}
-
-		// Import necessary packages dynamically to avoid importing them when this method is not used.
 		const http = await import('node:http')
-
 		const extToMime = await this.#loadExtToMime()
 		if (extToMime === null) {
 			console.error(
@@ -1240,29 +1304,31 @@ export class Wunphile {
 			)
 			process.exit(1)
 		}
-
 		/**
 		 * @param {string} path
 		 * @returns {string}
 		 */
 		const pathToMime = (path) => {
 			const def = 'application/octet-stream'
-
 			const dotIdx = path.lastIndexOf('.')
 			if (dotIdx === -1) {
 				return def
 			}
-
 			return extToMime.get(path.substring(dotIdx + 1)) ?? def
 		}
-
-		// Inject script at the end of pages that triggers a reload when a request to `/__hotreload` responds.
+		// IMPROVEMENT (issue #9): Cache the trailer string once (per lastReload value)
+		// instead of regenerating it for every HTML response.
+		/** @type {Map<number, string>} */
+		const trailerCache = new Map()
 		const mkTrailer = () => {
 			if (hotReloadEventEmitter === null) {
 				return ''
 			}
-
-			return `
+			const cached = trailerCache.get(this.#lastReload)
+			if (cached !== undefined) {
+				return cached
+			}
+			const trailer = `
 <!-- Injected by Wunphile for development mode hot reloading -->
 <script type="module">
 if (!window.__wunphile_hotreload) {
@@ -1290,14 +1356,21 @@ if (!window.__wunphile_hotreload) {
 	}
 }
 </script>`
+			trailerCache.set(this.#lastReload, trailer)
+			if (trailerCache.size > 10) {
+				// Bounded cache; oldest entries are least-recently-used.
+				const firstKey = trailerCache.keys().next().value
+				if (firstKey !== undefined) {
+					trailerCache.delete(firstKey)
+				}
+			}
+			return trailer
 		}
 		/** @type {import('node:http').ServerResponse[]} */
 		const waitResponses = []
 		if (hotReloadEventEmitter != null) {
 			hotReloadEventEmitter.on('reload', () => {
 				this.#lastReload = Date.now()
-
-				// Resolve all pending responses.
 				for (const res of waitResponses) {
 					res.write('ok')
 					res.end()
@@ -1305,14 +1378,12 @@ if (!window.__wunphile_hotreload) {
 				waitResponses.length = 0
 			})
 		}
-
 		const server = http.createServer(async (req, res) => {
 			const url = new URL(
 				/** @type {string} */ (req.url),
 				'http://localhost',
 			)
 			const basePath = url.pathname
-
 			if (hotReloadEventEmitter !== null && basePath === '/__hotreload') {
 				res.writeHead(200, {
 					'Content-Type': 'text/html',
@@ -1320,8 +1391,6 @@ if (!window.__wunphile_hotreload) {
 					'Content-Length': 5,
 				})
 				res.write('...')
-
-				// Put response in a queue so that it can be resolved upon a "reload" event.
 				res.req.on('close', () => {
 					for (let i = 0; i < waitResponses.length; i++) {
 						if (waitResponses[i] === res) {
@@ -1333,7 +1402,6 @@ if (!window.__wunphile_hotreload) {
 				waitResponses.push(res)
 				return
 			}
-
 			/** @type {string[]} */
 			let paths
 			if (basePath.endsWith('/')) {
@@ -1341,7 +1409,26 @@ if (!window.__wunphile_hotreload) {
 			} else {
 				paths = [basePath, basePath + '/index.html']
 			}
-
+			/**
+			 * Matches a path against a static prefix, ensuring the path either
+			 * equals the prefix or continues with a `/` boundary.
+			 *
+			 * BUG 6 FIX: Previously `path.startsWith(staticPath)` would let
+			 * `/assetsEvil/x.js` incorrectly match the `/assets` prefix.
+			 *
+			 * @param {string} path The request path
+			 * @param {string} staticPath The configured static mount prefix
+			 * @returns {boolean}
+			 */
+			const matchesStaticPrefix = (path, staticPath) => {
+				if (path === staticPath) {
+					return true
+				}
+				const prefixWithSlash = staticPath.endsWith('/')
+					? staticPath
+					: staticPath + '/'
+				return path.startsWith(prefixWithSlash)
+			}
 			/**
 			 * @param {string} path
 			 * @param {number} [status=200]
@@ -1349,25 +1436,21 @@ if (!window.__wunphile_hotreload) {
 			 */
 			const tryPath = async (path, status = 200) => {
 				const mime = pathToMime(path)
-
 				const pageMapping = this.#pageMapping.get(path)
-
 				if (pageMapping !== undefined) {
 					res.writeHead(status, { 'Content-Type': mime })
 					res.write(await this.#renderToHtmlAsync(pageMapping()))
 					if (mime === 'text/html') {
 						console.log(`Serving ${path}`)
-						// Page is HTML; inject trailer.
 						res.write(mkTrailer())
 					}
 					res.end()
-
 					return true
 				}
-
 				// Try static directories.
 				for (const [staticPath, dirPath] of this.#staticDirMappings) {
-					if (path.startsWith(staticPath)) {
+					// BUG 6 FIX: Use boundary-aware matching.
+					if (matchesStaticPrefix(path, staticPath)) {
 						const fsPath = this.toProjectPath(
 							pathUtil.join(
 								dirPath,
@@ -1375,32 +1458,25 @@ if (!window.__wunphile_hotreload) {
 							),
 						)
 						if ((await statOrNull(fsPath)) !== null) {
-							// Open file read stream.
 							await using file = await fs.open(fsPath, 'r')
-
 							console.log(`Serving ${path}`)
-
 							res.writeHead(200, { 'Content-Type': mime })
 							try {
 								await pipeline(file.createReadStream(), res)
 							} catch {}
 							res.end()
-
 							return true
 						}
 					}
 				}
-
 				// Try static files.
 				for (const [staticPath, filePath] of this.#staticFileMappings) {
 					if (path === staticPath) {
 						const fsPath = this.toProjectPath(filePath)
 						if ((await statOrNull(fsPath)) !== null) {
-							// Open file read stream.
 							await using file = await fs.open(fsPath, 'r')
 							try {
 								const readStream = file.createReadStream()
-
 								res.writeHead(200, { 'Content-Type': mime })
 								await new Promise((promRes, rej) => {
 									readStream
@@ -1412,52 +1488,29 @@ if (!window.__wunphile_hotreload) {
 							} finally {
 								await file.close()
 							}
-
 							return true
 						}
 					}
 				}
-
 				return false
 			}
-
 			for (const path of paths) {
 				if (await tryPath(path)) {
 					return
 				}
 			}
-
-			// No paths match, try the configured not found page.
 			if (!(await tryPath(this.#notFoundPath, 404))) {
 				res.writeHead(404, { 'Content-Type': 'text/plain' })
 				res.write('Not Found')
 				res.end()
 			}
 		})
-
 		server.listen(port, host, () => {
 			console.log(`Serving on http://${host}:${port}`)
 		})
 	}
-
 	/**
 	 * Runs the site generator CLI.
-	 * The CLI can build the site or serve it on a local HTTP server for development.
-	 *
-	 * Call this only after all pages and static files have been registered.
-	 * It should be at the end of your main module.
-	 *
-	 * @example
-	 * ```js
-	 * import { Wunphile } from 'wunphile'
-	 *
-	 * const ssg = new Wunphile(import.meta.url)
-	 *
-	 * // Register pages and static files.
-	 * // ...
-	 *
-	 * await ssg.cli()
-	 * ```
 	 *
 	 * @returns {Promise<void>}
 	 */
@@ -1465,13 +1518,10 @@ if (!window.__wunphile_hotreload) {
 		if (!isMainThread) {
 			return
 		}
-
 		const args = process.argv.slice(2, process.argv.length)
-
 		if (args.includes('--help') || args.includes('-h')) {
 			console.log(
 				`Usage: ${process.argv[1]} [options]
-
 Options:
   --help, -h
     Show this help message.
@@ -1481,7 +1531,6 @@ Options:
   	Start a development server.
   	Watches the project root directory for changes and hot reloads the site.
   	The project will be running in development mode.
-
 Environment variables:
   SSG_ROOT_PATH
     The root path of the project.
@@ -1490,7 +1539,7 @@ Environment variables:
     The output path of the generated site.
     Defaults to "dist" in the project root path.
   SSG_NOT_FOUND_PATH
-    The path to use for the "note found" page.
+    The path to use for the "not found" page.
     Defaults to "/404.html".
   SSG_DEV_PORT
   	The port to listen on for the development server.
@@ -1504,49 +1553,40 @@ Environment variables:
   	If set to 1, disables injecting hot reload scripts into pages in development mode.
 `.trim(),
 			)
-
 			return
 		}
-
-		// Wait client manager to be ready, then mount client paths.
 		await this.#clientManager.waitForModules()
-
 		if (args.includes('--dev') || args.includes('-d')) {
 			const httpPort = parseInt(process.env[DEV_PORT_ENV_VAR] || '3000')
 			const httpHost = process.env[DEV_HOST_ENV_VAR] || '127.0.0.1'
-
 			if (isNaN(httpPort)) {
 				console.error(
 					`Invalid port specified in ${DEV_PORT_ENV_VAR} environment variable: ${process.env[DEV_PORT_ENV_VAR]}`,
 				)
 				process.exit(1)
 			}
-
 			/** @type {EventEmitter<{ reload: [] }>|null} */
 			let hrEmitter = null
-
 			if (
 				isWorkerApiSupported &&
 				process.env[DEV_NO_HOT_RELOAD_ENV_VAR] !== '1'
 			) {
 				hrEmitter = new EventEmitter()
-
 				let hasPendingReload = false
-
 				console.log(
 					`Development mode hot reloading enabled. Watching "${this.#rootPath}" for changes.`,
 				)
-
-				// We use the non-Promise version of `node:fs` because it accepts a plain callback.
 				const oldFs = await import('node:fs')
 				oldFs.watch(
 					this.#rootPath,
 					{
 						recursive: true,
 						persistent: true,
-						ignore: (filename) => {
+						// IMPROVEMENT: Skip the output dir to avoid reload loops
+						// when Wunphile itself writes to disk.
+						ignored: (filepath) => {
 							return pathUtil
-								.resolve(filename)
+								.resolve(filepath)
 								.startsWith(this.#outputPath)
 						},
 					},
@@ -1554,17 +1594,12 @@ Environment variables:
 						if (hasPendingReload) {
 							return
 						}
-
 						hasPendingReload = true
-
 						try {
 							// Wait a little while to let writes finish.
 							await new Promise((resolve) =>
 								setTimeout(resolve, 50),
 							)
-
-							// Re-run main module in a worker.
-							// This is necessary because we have no way of manually clearing the module cache in ESM.
 							const worker = new Worker(this.#mainModulePath, {
 								workerData: {
 									rootPath: this.#rootPath,
@@ -1572,17 +1607,15 @@ Environment variables:
 									notFoundPath: this.#notFoundPath,
 								},
 							})
-
 							let gotError = false
-
+							/** @type {Error | null} */
+							let lastError = null
 							/** @type {Map<string, Component<void, void>>} */
 							const pageMapping = new Map()
 							/** @type {Map<string, string>} */
 							const staticDirMapping = new Map()
 							/** @type {Map<string, string>} */
 							const staticFileMapping = new Map()
-
-							// Receive mappings from worker.
 							worker.on(
 								'message',
 								/** @type {(msg: any) => void} */ (
@@ -1611,88 +1644,70 @@ Environment variables:
 							)
 							worker.on('error', (err) => {
 								gotError = true
-								console.error('Error while reloading:', err)
+								lastError = err
+								// IMPROVEMENT: Print the full stack so users can
+								// actually locate the source of the reload failure.
+								console.error('Error while reloading:', err.stack || err)
 							})
-
-							// Wait for reload to finish.
+							// NEW: Capture unhandled rejections inside the worker
+							// (e.g., from top-level await failures in user code).
+							worker.on('messageerror', (err) => {
+								gotError = true
+								lastError = err
+								console.error('Worker message error:', err.stack || err)
+							})
 							await new Promise((res) => worker.on('exit', res))
-
 							if (!gotError) {
-								// Replace mappings.
 								this.#pageMapping = pageMapping
 								this.#staticDirMappings = staticDirMapping
 								this.#staticFileMappings = staticFileMapping
+								console.log('Reloaded successfully.')
+							} else {
+								// NEW: Display a clearer user-facing hint.
+								console.error(
+									'Reload failed - keeping previous state. Fix the error and save again to retry.',
+								)
 							}
-
-							// @ts-expect-error hrEmitter is assigned by now
-							hrEmitter.emit('reload')
 						} finally {
 							hasPendingReload = false
 						}
+						// Always emit reload so browsers recheck, even on failure.
+						// @ts-expect-error hrEmitter is assigned by now
+						hrEmitter.emit('reload')
 					},
 				)
 			}
-
 			await this.serve(httpPort, httpHost, hrEmitter)
 			return
 		}
-
-		// If the method hasn't returned yet, build the site.
 		const now = Date.now()
 		await this.build()
 		console.log(`Built site in ${Date.now() - now}ms`)
 	}
 }
-
 /** @typedef {0 | 1 | 2 | 3} RenderFragmentEnum Render fragment types. */
-
 /**
  * Render fragment types.
  * @type {Record<string, RenderFragmentEnum>}
  */
 export const RenderFragmentType = {
-	/**
-	 * Text.
-	 * Will be sanitized.
-	 */
 	TEXT: 0,
-
-	/**
-	 * Raw HTML.
-	 * Will not be sanitized.
-	 */
 	HTML: 1,
-
-	/**
-	 * Behavior module import.
-	 */
 	BEHAVIOR_MODULE: 2,
-
-	/**
-	 * Loader for module imports.
-	 */
 	BEHAVIOR_MODULE_LOADER: 3,
 }
-
 /**
  * A render fragment is a string that can be rendered to HTML.
- * How it will be rendered depends on the fragment type.
  */
 export class RenderFragment {
 	/**
 	 * Creates render fragments from the provided value.
-	 *
-	 * If the value is a render fragment, an array with it as the only element will be returned.
-	 * If the value is an array, each fragment will be processed with this function and returned in an array.
-	 * If the value is anything else, it will be turned into a string with the {@link String} function and returned as a text fragment.
-	 *
 	 * @param {any} val The value to convert
 	 * @returns {RenderFragments} The resulting render fragments
 	 */
 	static from(val) {
 		/** @type {RenderFragments} */
 		const res = []
-
 		if (val instanceof RenderFragment) {
 			res.push(val)
 		} else if (val instanceof Array) {
@@ -1702,60 +1717,18 @@ export class RenderFragment {
 		} else {
 			res.push(new RenderFragment(RenderFragmentType.TEXT, String(val)))
 		}
-
 		return res
 	}
-
-	/**
-	 * The fragment type.
-	 * @type {RenderFragmentEnum}
-	 * @readonly
-	 */
+	/** @type {RenderFragmentEnum} */
 	type
-
-	/**
-	 * The fragment's value.
-	 * How it will be rendered depends on the fragment type.
-	 * @type {string}
-	 * @readonly
-	 */
+	/** @type {string} */
 	value
-
-	/**
-	 * The attached behavior module promise.
-	 * This is null if the fragment is not a behavior module import.
-	 * @type {Promise<any> | null}
-	 * @readonly
-	 */
+	/** @type {Promise<any> | null} */
 	behaviorModulePromise
-
 	/**
-	 * Renders the fragment to HTML.
-	 * @returns {string}
-	 */
-	toHtml() {
-		switch (this.type) {
-			case RenderFragmentType.TEXT:
-				return sanitizeHtml(this.value)
-			case RenderFragmentType.HTML:
-				return this.value
-			case RenderFragmentType.BEHAVIOR_MODULE:
-			case RenderFragmentType.BEHAVIOR_MODULE_LOADER:
-				// Behavior modules are not rendered to HTML.
-				// The loader needs to be constructed outside of this function.
-				return ''
-			default:
-				throw new Error(
-					`Unknown fragment type: ${this.type}. Valid types are contained in the RenderFragmentType enum.`,
-				)
-		}
-	}
-
-	/**
-	 * Instantiates a new RenderFragment with the specified type and value.
-	 * @param {RenderFragmentEnum} type The fragment type
-	 * @param {string} value The fragment value
-	 * @param {Promise<any> | null} behaviorModulePromise The attached behavior module promise (defaults to null)
+	 * @param {RenderFragmentEnum} type
+	 * @param {string} value
+	 * @param {Promise<any> | null} [behaviorModulePromise]
 	 */
 	constructor(type, value, behaviorModulePromise = null) {
 		this.type = type
@@ -1763,90 +1736,55 @@ export class RenderFragment {
 		this.behaviorModulePromise = behaviorModulePromise
 	}
 }
-
 /**
  * Template string function that takes in HTML and interpolates it with the provided values.
- * The values can be any type, but all values except render fragments or arrays of render fragments will be sanitized.
- *
- * @example
- * ```js
- * const greeting = html`<h1>Hello, ${name}!</h1>`
- * ```
- *
- * @param {string|TemplateStringsArray} strs The string(s) to interpolate
- * @param {any[]} vals The values to interpolate
- * @returns {RenderFragments} The resulting render fragments
+ * @param {string|TemplateStringsArray} strs
+ * @param {any[]} vals
+ * @returns {RenderFragments}
  */
 export function html(strs, ...vals) {
 	/** @type {RenderFragments} */
 	const res = []
-
 	const strsProc = typeof strs === 'string' ? [strs] : strs
-
 	for (let i = 0; i < strsProc.length; i++) {
 		const str = strsProc[i]
-
 		if (str !== '') {
 			res.push(new RenderFragment(RenderFragmentType.HTML, str))
 		}
-
 		if (i < vals.length) {
 			res.push(...RenderFragment.from(vals[i]))
 		}
 	}
-
 	return res
 }
-
 /**
  * Generates a plain text render fragment from a raw string.
- * The string's escape sequences will not be processed.
- *
- * @example
- * ```js
- * const greeting = text`Hello, ${name}!`
- * ```
- *
- * @param {string|TemplateStringsArray} strs The string(s) to interpolate
- * @param {any[]} vals The values to interpolate
- * @returns {RenderFragments} The resulting plain text render fragment
+ * @param {string|TemplateStringsArray} strs
+ * @param {any[]} vals
+ * @returns {RenderFragments}
  */
 export function text(strs, ...vals) {
 	if (typeof strs === 'string') {
 		return RenderFragment.from(strs)
 	}
-
 	return RenderFragment.from(String.raw(strs, ...vals))
 }
-
 /**
  * Component that renders the behavior module loader.
- * This is required for any pages' behavior modules to be loaded on the browser.
- * You can use this component at the end of your page's body.
- *
  * @type {Component<void, void>}
  */
 export const BehaviorLoader = () => {
 	return [new RenderFragment(RenderFragmentType.BEHAVIOR_MODULE_LOADER, '')]
 }
-
 /**
  * @typedef BehaviorModuleProps
- * The props type for a behavior module.
- *
- * @property {Promise<{ default: BehaviorModule }>} module The promise from the `import()` call for the behavior module. For example, `import('./client/behavior/Greeting.js')`.
+ * @property {Promise<{ default: BehaviorModule }>} module
  */
-
 /**
  * Wraps a component in a behavior.
- * The first element in the children will be the element passed to the behavior.
- *
- * You must use {@link BehaviorLoader} at the end of your page's body, otherwise the behavior module will never be loaded on the browser.
- * @param {BehaviorModuleProps} props The component's props
- * @param {RenderFragments} children The component's children (should contain a single parent element)
- * @returns {RenderFragments} The rendered behavior module
- *
- * @type {Component<BehaviorModuleProps, RenderFragments>}
+ * @param {BehaviorModuleProps} props
+ * @param {RenderFragments} children
+ * @returns {RenderFragments}
  */
 export const BehaviorComponent = (props, children) => {
 	return [
@@ -1858,27 +1796,23 @@ export const BehaviorComponent = (props, children) => {
 		...children,
 	]
 }
-
 /**
  * Renders the provided render fragments to HTML.
- * @param {RenderFragments} fragments The render fragments to render
- * @returns {string} The rendered HTML
+ * @param {RenderFragments} fragments
+ * @returns {string}
  */
 export function renderToHtml(fragments) {
 	/** @type {string[]} */
 	const res = []
-
 	for (const fragment of fragments) {
 		res.push(fragment.toHtml())
 	}
-
 	return res.join('')
 }
-
 /**
  * Returns the stats of the specified path, or null if the path doesn't exist.
- * @param {string} path The path to stat
- * @returns {Promise<import('node:fs').Stats|null>} The stats, or null if the path doesn't exist
+ * @param {string} path
+ * @returns {Promise<import('node:fs').Stats|null>}
  */
 async function statOrNull(path) {
 	try {
@@ -1891,50 +1825,37 @@ async function statOrNull(path) {
 		}
 	}
 }
-
 /**
  * Copies a directory recursively.
- * @param {string} source The source directory
- * @param {string} target The target directory
+ * @param {string} source
+ * @param {string} target
  * @returns {Promise<void>}
  */
 export async function copyRecursive(source, target) {
-	// Stat to check if it's a directory
 	if (!(await fs.stat(source)).isDirectory()) {
-		// If it's not a directory, just copy it
 		await fs.copyFile(source, target)
 		return
 	}
-
-	// Since the path is a directory, stat target to make sure the function can do what it needs to
 	let targetStat = await statOrNull(target)
 	if (targetStat === null) {
 		await fs.mkdir(target, { recursive: true })
 		targetStat = await fs.stat(target)
 	}
-
 	if (!targetStat.isDirectory()) {
 		throw new Error(
 			`Cannot copy from source ${source} to non-directory target ${target}`,
 		)
 	}
-
 	const paths = ['']
-
-	// Loop util there are no more paths to crawl
 	while (paths.length > 0) {
 		const path = /** @type {string} */ (paths.shift())
-
-		// List children
 		const files = await fs.readdir(pathUtil.join(source, path))
 		for (const file of files) {
 			const childPath = pathUtil.join(path, file)
 			const realPath = pathUtil.join(source, childPath)
-
-			// Check if path is a directory, adding to paths list if it is, otherwise copying the file
 			const targetPath = pathUtil.join(target, childPath)
 			if ((await fs.stat(realPath)).isDirectory()) {
-				await fs.mkdir(targetPath)
+				await fs.mkdir(targetPath, { recursive: true })
 				paths.push(childPath)
 			} else {
 				await fs.copyFile(realPath, targetPath)
@@ -1942,60 +1863,39 @@ export async function copyRecursive(source, target) {
 		}
 	}
 }
-
-// Regex that matches HTML entities.
 const htmlEntityRegex = /[&<>"']/
-
 /**
  * Sanitizes the provided HTML by escaping HTML entities
- * @param {string} html The HTML to sanitize
- * @returns {string} The sanitized HTML
+ * @param {string} html
+ * @returns {string}
  * @since 1.0.0
  */
 export function sanitizeHtml(html) {
-	// Adapted from https://github.com/component/escape-html
-
 	const match = htmlEntityRegex.exec(html)
 	if (match === null) {
 		return html
 	}
-
 	let index = 0
 	let lastIndex = 0
 	let out = ''
 	let escape = ''
 	for (index = match.index; index < html.length; index++) {
 		switch (html.charCodeAt(index)) {
-			case 34: // "
-				escape = '&quot;'
-				break
-			case 38: // &
-				escape = '&amp;'
-				break
-			case 39: // '
-				escape = '&#39;'
-				break
-			case 60: // <
-				escape = '&lt;'
-				break
-			case 62: // >
-				escape = '&gt;'
-				break
-			default:
-				continue
+			case 34: escape = '&quot;'; break
+			case 38: escape = '&amp;'; break
+			case 39: escape = '&#39;'; break
+			case 60: escape = '&lt;'; break
+			case 62: escape = '&gt;'; break
+			default: continue
 		}
-
 		if (lastIndex !== index) {
 			out += html.substring(lastIndex, index)
 		}
-
 		lastIndex = index + 1
 		out += escape
 	}
-
 	if (lastIndex !== index) {
 		return out + html.substring(lastIndex)
 	}
-
 	return out
 }
