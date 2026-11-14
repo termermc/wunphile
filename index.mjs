@@ -3,7 +3,10 @@ import process from 'node:process'
 // ("D:\...") into file: URLs before passing them to dynamic import().
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { EventEmitter } from 'node:events'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import { createRequire } from 'node:module'
+import * as zlib from 'node:zlib'
+import * as fsSync from 'node:fs'
 // Import worker thread APIs dynamically.
 // If the APIs are not available, we disable functionality that depends on them.
 let isWorkerApiSupported = false
@@ -87,6 +90,125 @@ const CLIENT_MOUNT_PREFIX = '/_wfclient/'
  * @type {string}
  */
 const CLIENT_BEHAVIOR_HYDRATE_PREFIX = 'wf-behavior:'
+/**
+ * Prefix used for generated development endpoints.
+ * @type {string}
+ */
+const DEV_ENDPOINT_PREFIX = '/__hotreload'
+/**
+ * Filesystems paths of Wunphile's own bookkeeping (never deleted).
+ * @type {string}
+ */
+const CACHE_DIR = '.wunphile'
+/* ======================================================================
+ * Public types
+ *
+ * These module-scope JSDoc typedefs are what make `tsc --checkJs` resolve
+ * the names used throughout the file, and they are emitted into the
+ * generated `dist/index.d.mts` so TypeScript consumers can import them.
+ * A hand-written `types.d.ts` mirrors them for `wunphile/types`.
+ * ==================================================================== */
+/** @typedef {0 | 1 | 2 | 3 | 4} RenderFragmentEnum */
+/** @typedef {RenderFragment[]} RenderFragments */
+/** @typedef {'eager' | 'visible' | 'idle' | 'interaction'} LoadStrategy */
+/**
+ * @typedef {object} BehaviorModule
+ * @property {string} behaviorModuleUrl
+ * @property {((elem: Element, ctx?: any) => void) | undefined} [behavior]
+ * @property {Record<string, (...args: any[]) => any> | undefined} [functions]
+ * @property {string | undefined} [styles] CSS shipped alongside this module.
+ * @property {LoadStrategy | undefined} [load] Default hydration strategy.
+ */
+/**
+ * @typedef {object} PageContext
+ * @property {string} path
+ * @property {Record<string, string>} params
+ * @property {any} [entry]
+ * @property {Record<string, ContentEntry[]>} collections
+ * @property {Wunphile} wunphile
+ * @property {string | null} locale
+ * @property {string[]} locales
+ * @property {{ locale: string, href: string }[]} localeLinks
+ */
+/**
+ * A page component. `Component<void, void>` remains valid for legacy code.
+ * @template [P=void] Props type
+ * @template [C=void] Children type
+ * @typedef {(ctx?: PageContext & { props?: P, children?: C }) => RenderFragments | Promise<RenderFragments>} Component
+ */
+/**
+ * @typedef {object} ContentEntry
+ * @property {string} slug
+ * @property {string} path
+ * @property {Record<string, any>} data
+ * @property {string} body
+ * @property {string} html
+ * @property {string} title
+ * @property {string} description
+ * @property {string} date
+ * @property {number} mtime
+ * @property {Record<string, string>} params
+ */
+/**
+ * @typedef {object} StaticOptions
+ * @property {boolean} [hash] Emit a content-hashed filename and a manifest entry.
+ * @property {boolean} [transform] Allow asset transforms (optional deps / hooks).
+ * @property {Record<string, string>} [headers] Extra headers for adapter configs.
+ */
+/**
+ * @typedef {object} Plugin
+ * @property {string} [name]
+ * @property {(html: string, path: string) => string | void | Promise<string | void>} [onPageRender]
+ * @property {(asset: any) => void | Promise<void>} [onAsset]
+ * @property {(manifest: any) => void | Promise<void>} [onBuildEnd]
+ * @property {(req: any, res: any) => boolean | void | Promise<boolean | void>} [onDevRequest]
+ */
+/**
+ * @typedef {object} BuildOptions
+ * @property {('gzip' | 'br')[]} [precompress]
+ * @property {boolean} [incremental]
+ * @property {boolean} [stats]
+ * @property {number} [concurrency]
+ * @property {boolean} [quiet]
+ */
+/**
+ * @typedef {object} WunphileConfig
+ * @property {string} [root]
+ * @property {string} [outDir]
+ * @property {string} [base]
+ * @property {string} [clientDir]
+ * @property {string} [notFoundPath]
+ * @property {string | { baseUrl: string, path?: string }} [sitemap]
+ * @property {string} [baseUrl]
+ * @property {boolean} [minify]
+ * @property {Plugin[]} [plugins]
+ * @property {any} [markdown]
+ * @property {any} [image]
+ * @property {any} [adapter]
+ * @property {any} [i18n]
+ * @property {any} [feed]
+ * @property {any} [robots]
+ * @property {any} [ogImage]
+ * @property {any} [content]
+ * @property {string} [loader]
+ * @property {boolean} [absoluteImports]
+ * @property {boolean} [csp]
+ * @property {BuildOptions} [build]
+ */
+/**
+ * @typedef {object} SitemapEntry
+ * @property {string} [path]
+ * @property {string} [loc]
+ * @property {string | number | Date} [lastmod]
+ * @property {string} [changefreq]
+ * @property {number | string} [priority]
+ * @property {{ hreflang: string, href: string }[]} [alternates]
+ */
+/**
+ * @typedef {object} DevHandle
+ * @property {import('node:http').Server} server
+ * @property {() => Promise<void>} close
+ */
 /* ======================================================================
  * NEW: Path utilities (BUG 1 / BUG 3 fix infrastructure)
  * ==================================================================== */
@@ -243,6 +365,1362 @@ function parseQuotedString(raw) {
 	}
 	return out
 }
+/* ======================================================================
+ * Pure helpers. Everything in this section is exported (or used by an
+ * exported function) and is deliberately free of instance state so that it
+ * can be unit tested and reused by plugins. See feature #39.
+ * ==================================================================== */
+/**
+ * Reads a legacy `SSG_*` environment variable, preferring its `WUNPHILE_*`
+ * alias. The legacy names are kept as the contract (#26).
+ * @param {string} legacyName
+ * @returns {string}
+ */
+export function readEnv(legacyName) {
+	const alias = 'WUNPHILE_' + legacyName.replace(/^SSG_/, '')
+	return process.env[alias] || process.env[legacyName] || ''
+}
+/**
+ * Computes a hex SHA-256 digest of a string or Buffer.
+ * @param {string | Buffer | Uint8Array} content
+ * @returns {string}
+ */
+export function sha256(content) {
+	return createHash('sha256').update(content).digest('hex')
+}
+/**
+ * Computes the short (8 char) content hash used in fingerprinted filenames.
+ * @param {string | Buffer | Uint8Array} content
+ * @returns {string}
+ */
+export function contentHash(content) {
+	return sha256(content).slice(0, 8)
+}
+/**
+ * Inserts a hash (or any infix) before the final file extension.
+ * `/assets/app.js` + `a1b2c3d4` -> `/assets/app.a1b2c3d4.js`
+ * @param {string} path
+ * @param {string} infix
+ * @returns {string}
+ */
+export function hashPath(path, infix) {
+	const slash = path.lastIndexOf('/')
+	const dot = path.lastIndexOf('.')
+	if (dot <= slash + 1) {
+		return `${path}.${infix}`
+	}
+	return `${path.slice(0, dot)}.${infix}${path.slice(dot)}`
+}
+/**
+ * Escapes a value for use inside a double-quoted HTML attribute.
+ *
+ * NOTE: this is an *entity escaper*, exactly like {@link sanitizeHtml}. It
+ * does not make arbitrary HTML safe and does not implement an HTML sanitizer.
+ * @param {unknown} value
+ * @returns {string}
+ */
+export function escapeAttribute(value) {
+	return sanitizeHtml(String(value ?? ''))
+}
+/**
+ * Converts an HTML string to plain text (used for RSS/Atom descriptions).
+ * Tags are removed, entities decoded and runs of whitespace collapsed.
+ * @param {string} htmlStr
+ * @returns {string}
+ */
+export function stripHtml(htmlStr) {
+	return String(htmlStr ?? '')
+		.replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+		.replace(/<[^>]*>/g, ' ')
+		.replace(/&nbsp;/gi, ' ')
+		.replace(/&lt;/gi, '<')
+		.replace(/&gt;/gi, '>')
+		.replace(/&quot;/gi, '"')
+		.replace(/&#39;/g, "'")
+		.replace(/&amp;/gi, '&')
+		.replace(/\s+/g, ' ')
+		.trim()
+}
+/**
+ * True when a URL path represents an HTML document (as opposed to e.g. a
+ * generated `.js` client module or an XML feed).
+ * @param {string} path
+ * @returns {boolean}
+ */
+export function isHtmlPath(path) {
+	const clean = path.split('?')[0].split('#')[0]
+	return (
+		clean.endsWith('.html') ||
+		clean.endsWith('/') ||
+		clean.lastIndexOf('.') <= clean.lastIndexOf('/')
+	)
+}
+/**
+ * Validates a redirect target.
+ *
+ * SECURITY (#34): only absolute-path and http(s) URLs are allowed. Without
+ * this check, `javascript:alert(1)` ends up in both `href` and
+ * `location.assign()` and executes in the browser.
+ *
+ * @param {string} url
+ * @returns {string} The validated URL
+ * @throws {Error} When the URL is not safe
+ */
+export function safeRedirectUrl(url) {
+	const value = String(url ?? '')
+	if (value === '' || /[\u0000-\u001f\u007f]/.test(value)) {
+		throw new Error(`Unsafe redirect URL: ${JSON.stringify(value)}`)
+	}
+	const lower = value.toLowerCase()
+	const isRelative = value.startsWith('/')
+	const isHttp = lower.startsWith('http://') || lower.startsWith('https://')
+	if (!isRelative && !isHttp) {
+		throw new Error(
+			`Unsafe redirect URL "${value}": only paths starting with "/" and http(s) URLs are allowed.`,
+		)
+	}
+	return value
+}
+/**
+ * Produces a JavaScript string literal that is also safe inside an inline
+ * `<script>` element (i.e. `</script>` cannot terminate it).
+ * @param {string} value
+ * @returns {string}
+ */
+export function jsStringLiteral(value) {
+	return JSON.stringify(String(value))
+		.replace(/</g, '\\u003c')
+		.replace(/>/g, '\\u003e')
+		.replace(/&/g, '\\u0026')
+		.replace(/\u2028/g, '\\u2028')
+		.replace(/\u2029/g, '\\u2029')
+}
+/**
+ * Minifies an HTML string (conservatively).
+ *
+ * Protects `<pre>`, `<textarea>`, `<script>` and `<style>` contents, removes
+ * HTML comments except conditional comments, `wf-behavior:` hydration
+ * markers and any user-requested prefixes, collapses whitespace *between
+ * tags only*, and trims.
+ *
+ * Exported as a pure function so plugins can reuse it (#39).
+ * @param {string} htmlStr
+ * @param {{ preserveCommentPrefixes?: string[] }} [opts]
+ * @returns {string}
+ */
+export function minifyHtml(htmlStr, opts = {}) {
+	const extra = opts.preserveCommentPrefixes ?? []
+	const protectedRe =
+		/(<(pre|textarea|script|style)\b[^>]*>[\s\S]*?<\/\2>)/gi
+	/** @type {string[]} */
+	const placeholders = []
+	const masked = htmlStr.replace(protectedRe, (match) => {
+		placeholders.push(match)
+		return `\u0000${placeholders.length - 1}\u0000`
+	})
+	const preserve = ['\\[if', 'wf-behavior:', ...extra.map(escapeRegex)]
+	const commentRe = new RegExp(
+		`<!--(?!${preserve.join('|')})[\\s\\S]*?-->`,
+		'g',
+	)
+	let out = masked
+		.replace(commentRe, '')
+		.replace(/>\s+</g, '><')
+		.trim()
+	out = out.replace(/\u0000(\d+)\u0000/g, (_, idx) =>
+		placeholders[Number(idx)],
+	)
+	return out
+}
+/**
+ * Escapes a string for use inside a regular expression.
+ * @param {string} str
+ * @returns {string}
+ */
+function escapeRegex(str) {
+	return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+/**
+ * Coerces a sitemap `lastmod` value to an ISO date (YYYY-MM-DD supported).
+ * @param {string | number | Date | undefined | null} value
+ * @returns {string | null}
+ */
+function sitemapLastmod(value) {
+	if (value == null) {
+		return null
+	}
+	if (value instanceof Date) {
+		return value.toISOString().slice(0, 10)
+	}
+	if (typeof value === 'number') {
+		return new Date(value).toISOString().slice(0, 10)
+	}
+	const str = String(value).trim()
+	return str === '' ? null : str
+}
+/**
+ * Builds a `sitemap.xml` document from entries.
+ *
+ * Pure function (#39) - plugins and tests can call it directly.
+ * @param {SitemapEntry[] | string[]} entries
+ * @param {string} baseUrl
+ * @returns {string}
+ */
+export function buildSitemap(entries, baseUrl) {
+	const base = baseUrl.replace(/\/+$/, '')
+	const normalized = entries.map((entry) =>
+		typeof entry === 'string' ? { loc: entry } : entry,
+	)
+	const hasAlternates = normalized.some((e) => e.alternates?.length)
+	const xmlns = hasAlternates
+		? ' xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml"'
+		: ' xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"'
+	const urls = normalized.map((entry) => {
+		const loc =
+			entry.loc != null
+				? entry.loc.startsWith('http')
+					? entry.loc
+					: base + entry.loc
+				: base + (entry.path ?? '')
+		const lines = [`    <loc>${sanitizeHtml(loc)}</loc>`]
+		const lastmod = sitemapLastmod(entry.lastmod)
+		if (lastmod != null) {
+			lines.push(`    <lastmod>${sanitizeHtml(lastmod)}</lastmod>`)
+		}
+		if (entry.changefreq) {
+			lines.push(
+				`    <changefreq>${sanitizeHtml(String(entry.changefreq))}</changefreq>`,
+			)
+		}
+		if (entry.priority != null) {
+			lines.push(
+				`    <priority>${sanitizeHtml(String(entry.priority))}</priority>`,
+			)
+		}
+		for (const alt of entry.alternates ?? []) {
+			lines.push(
+				`    <xhtml:link rel="alternate" hreflang="${escapeAttribute(alt.hreflang)}" href="${escapeAttribute(alt.href)}" />`,
+			)
+		}
+		return `  <url>\n${lines.join('\n')}\n  </url>`
+	})
+	return `<?xml version="1.0" encoding="UTF-8"?>\n<urlset${xmlns}>\n${urls.join('\n')}\n</urlset>\n`
+}
+/**
+ * Builds a sitemap index for split sitemaps (#31).
+ * @param {string[]} sitemapUrls Absolute URLs of the sitemap parts
+ * @returns {string}
+ */
+export function buildSitemapIndex(sitemapUrls) {
+	const parts = sitemapUrls.map(
+		(url) =>
+			`  <sitemap>\n    <loc>${sanitizeHtml(url)}</loc>\n    <lastmod>${new Date().toISOString().slice(0, 10)}</lastmod>\n  </sitemap>`,
+	)
+	return `<?xml version="1.0" encoding="UTF-8"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${parts.join('\n')}\n</sitemapindex>\n`
+}
+/**
+ * @typedef {{ p: string, l: LoadStrategy, s?: string }} LoaderDescriptor
+ */
+/**
+ * Normalizes loader input (legacy string paths or full descriptors).
+ * @param {(string | LoaderDescriptor | { path: string, load?: LoadStrategy, styles?: string })[]} input
+ * @returns {LoaderDescriptor[]}
+ */
+function normalizeLoaderDescriptors(input) {
+	/** @type {Map<string, LoaderDescriptor>} */
+	const out = new Map()
+	for (const raw of input) {
+		const desc =
+			typeof raw === 'string'
+				? { p: toPosixPath(raw), l: /** @type {LoadStrategy} */ ('eager') }
+				: 'p' in raw
+					? {
+							p: toPosixPath(raw.p),
+							l: /** @type {LoadStrategy} */ (raw.l || 'eager'),
+							s: raw.s,
+						}
+					: {
+							p: toPosixPath(raw.path),
+							l: /** @type {LoadStrategy} */ (raw.load || 'eager'),
+							s: raw.styles,
+						}
+		out.set(JSON.stringify(desc), desc)
+	}
+	return [...out.values()]
+}
+/**
+ * Returns the hydration comment text for a behavior descriptor.
+ * @param {LoaderDescriptor} desc
+ * @returns {string}
+ */
+export function behaviorComment(desc) {
+	if (desc.l === 'eager' && !desc.s) {
+		return CLIENT_BEHAVIOR_HYDRATE_PREFIX + desc.p
+	}
+	return CLIENT_BEHAVIOR_HYDRATE_PREFIX + JSON.stringify(desc)
+}
+/**
+ * The client-side hydration runtime shared by all loader strategies.
+ * @type {string}
+ */
+const HYDRATE_RUNTIME = `
+const WF_PREFIX = ${JSON.stringify(CLIENT_BEHAVIOR_HYDRATE_PREFIX)};
+function wfReport(err, path) {
+    console.error('[wunphile] behavior failed:', path, err);
+    try {
+        fetch('/_wfclient/error', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, error: String(err && err.stack || err) }), keepalive: true });
+    } catch {}
+}
+function wfComment(desc) {
+    return desc.l === 'eager' && !desc.s ? WF_PREFIX + desc.p : WF_PREFIX + JSON.stringify(desc);
+}
+function wfStyles(desc) {
+    if (!desc.s) return;
+    try {
+        if ('adoptedStyleSheets' in document && 'CSSStyleSheet' in window) {
+            const sheet = new CSSStyleSheet();
+            sheet.replaceSync(desc.s);
+            document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
+        } else {
+            const style = document.createElement('style');
+            style.textContent = desc.s;
+            document.head.appendChild(style);
+        }
+    } catch (err) { wfReport(err, desc.p); }
+}
+function wfRun(mod, elem, desc) {
+    try {
+        if (typeof mod.behavior === 'function') mod.behavior(elem, desc);
+    } catch (err) { wfReport(err, desc.p); }
+}
+function wfSchedule(mod, elem, desc) {
+    const load = desc.l || 'eager';
+    if (load === 'idle') {
+        (window.requestIdleCallback || ((fn) => setTimeout(fn, 1)))(() => wfRun(mod, elem, desc));
+    } else if (load === 'visible' && 'IntersectionObserver' in window) {
+        const io = new IntersectionObserver((entries) => {
+            if (entries.some((e) => e.isIntersecting)) { io.disconnect(); wfRun(mod, elem, desc); }
+        });
+        io.observe(elem);
+    } else if (load === 'interaction') {
+        const events = ['click', 'pointerdown', 'touchstart', 'focusin'];
+        const handler = () => { for (const ev of events) elem.removeEventListener(ev, handler); wfRun(mod, elem, desc); };
+        for (const ev of events) elem.addEventListener(ev, handler, { passive: true });
+    } else {
+        wfRun(mod, elem, desc);
+    }
+}
+function hydrate(mod, rawDesc) {
+    const desc = typeof rawDesc === 'string' ? { p: rawDesc, l: 'eager' } : rawDesc;
+    if (!mod) return;
+    wfStyles(desc);
+    const comment = wfComment(desc);
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_COMMENT);
+    let node;
+    while ((node = walker.nextNode())) {
+        if (node.nodeType !== Node.COMMENT_NODE || node.textContent !== comment) continue;
+        let elem = null;
+        let nextNode;
+        while ((nextNode = walker.nextNode())) {
+            if (nextNode.nodeType === Node.ELEMENT_NODE) { elem = nextNode; break; }
+        }
+        if (elem) wfSchedule(mod, elem, desc);
+    }
+}
+`.trim()
+/**
+ * Generates the client loader JavaScript.
+ *
+ * `strategy: 'dynamic'` (default) keeps the historical `import()` form.
+ * `strategy: 'static'` emits hoisted static `import` declarations so the
+ * browser's module preloader can fetch every behavior in parallel (#18).
+ *
+ * Pure function (#39). `ClientManager.generateLoaderScript` delegates here.
+ *
+ * @param {(string | LoaderDescriptor | { path: string, load?: LoadStrategy, styles?: string })[]} paths
+ * @param {{ strategy?: 'dynamic' | 'static', base?: string }} [opts]
+ * @returns {string}
+ */
+export function generateLoaderScript(paths, opts = {}) {
+	const descs = normalizeLoaderDescriptors(paths)
+	if (descs.length === 0) {
+		return ''
+	}
+	const mount = opts.base ?? CLIENT_MOUNT_PREFIX
+	const strategy = opts.strategy ?? 'dynamic'
+	if (strategy === 'static') {
+		/** @type {string[]} */
+		const stmts = []
+		descs.forEach((desc, i) => {
+			stmts.push(
+				`import * as wfMod${i} from ${JSON.stringify(mount + desc.p)};`,
+			)
+		})
+		descs.forEach((desc, i) => {
+			stmts.push(
+				`try { hydrate(wfMod${i}.default, ${JSON.stringify(desc)}); } catch (err) { wfReport(err, ${JSON.stringify(desc.p)}); }`,
+			)
+		})
+		return HYDRATE_RUNTIME + '\n' + stmts.join('\n')
+	}
+	const stmts = descs.map(
+		(desc) =>
+			`import(${JSON.stringify(mount + desc.p)}).then(mod => hydrate(mod.default, ${JSON.stringify(desc)}), err => wfReport(err, ${JSON.stringify(desc.p)}))`,
+	)
+	return HYDRATE_RUNTIME + '\n' + stmts.join(';\n')
+}
+/**
+ * Generates `<link rel="modulepreload">` tags for behavior modules (#18).
+ * @param {(string | LoaderDescriptor | { path: string })[]} paths
+ * @param {string} [base]
+ * @returns {string}
+ */
+export function modulePreloadLinks(paths, base = CLIENT_MOUNT_PREFIX) {
+	const seen = new Set()
+	const out = []
+	for (const desc of normalizeLoaderDescriptors(paths)) {
+		if (seen.has(desc.p)) {
+			continue
+		}
+		seen.add(desc.p)
+		out.push(
+			`<link rel="modulepreload" href="${escapeAttribute(base + desc.p)}" />`,
+		)
+	}
+	return out.join('\n')
+}
+
+/* ----------------------------------------------------------------------
+ * Optional dependency resolution (zero mandatory dependencies, #2/#5/#9/#10)
+ * -------------------------------------------------------------------- */
+/** @type {Map<string, any>} */
+const optionalDepCache = new Map()
+/**
+ * Resolves an optional dependency synchronously, preferring the user's
+ * project over Wunphile's own location. Returns null when absent.
+ * @param {string} name
+ * @param {string} [rootPath]
+ * @returns {any}
+ */
+export function resolveOptional(name, rootPath = process.cwd()) {
+	const key = `${name}|${rootPath}`
+	if (optionalDepCache.has(key)) {
+		return optionalDepCache.get(key)
+	}
+	/** @type {any} */
+	let found = null
+	const requirers = [
+		createRequire(
+			pathToFileURL(pathUtil.join(rootPath, 'package.json')).href,
+		),
+		createRequire(import.meta.url),
+	]
+	for (const req of requirers) {
+		try {
+			found = req(name)
+			if (found) {
+				break
+			}
+		} catch {}
+	}
+	optionalDepCache.set(key, found)
+	return found
+}
+/* ----------------------------------------------------------------------
+ * Frontmatter + Markdown (#5)
+ * -------------------------------------------------------------------- */
+/**
+ * Parses a single scalar frontmatter value.
+ * @param {string} raw
+ * @returns {any}
+ */
+function frontmatterValue(raw) {
+	const value = raw.trim()
+	if (value === '') {
+		return ''
+	}
+	if (
+		(value.startsWith('"') && value.endsWith('"')) ||
+		(value.startsWith("'") && value.endsWith("'"))
+	) {
+		return value.slice(1, -1)
+	}
+	if (value.startsWith('[') && value.endsWith(']')) {
+		return value
+			.slice(1, -1)
+			.split(',')
+			.map((s) => frontmatterValue(s))
+			.filter((s) => s !== '')
+	}
+	if (/^(true|false)$/i.test(value)) {
+		return value.toLowerCase() === 'true'
+	}
+	if (/^-?\d+(\.\d+)?$/.test(value)) {
+		return Number(value)
+	}
+	return value
+}
+/**
+ * Parses YAML-like frontmatter from a Markdown document.
+ * Supports scalars, quoted strings, numbers, booleans and inline arrays,
+ * which covers the common blog/documentation frontmatter subset.
+ * @param {string} raw
+ * @returns {{ data: Record<string, any>, body: string }}
+ */
+export function parseFrontmatter(raw) {
+	const src = String(raw ?? '').replace(/^\uFEFF/, '')
+	const match = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(
+		src,
+	)
+	if (match == null) {
+		return { data: {}, body: src }
+	}
+	/** @type {Record<string, any>} */
+	const data = {}
+	for (const line of match[1].split(/\r?\n/)) {
+		if (line.trimStart().startsWith('#') || line.trim() === '') {
+			continue
+		}
+		const colon = line.indexOf(':')
+		if (colon === -1) {
+			continue
+		}
+		const key = line.slice(0, colon).trim()
+		if (key !== '') {
+			data[key] = frontmatterValue(line.slice(colon + 1))
+		}
+	}
+	return { data, body: src.slice(match[0].length) }
+}
+/**
+ * Escapes a Markdown link target, rejecting dangerous schemes.
+ * @param {string} href
+ * @returns {string}
+ */
+function markdownHref(href) {
+	const value = href.trim()
+	if (
+		!/^(https?:\/\/|\/|#|mailto:|\.\/|\.\.\/)/i.test(value) &&
+		!/^[\w.-]+\/[\w./-]+$/.test(value)
+	) {
+		return '#'
+	}
+	return escapeAttribute(value)
+}
+/**
+ * Minimal inline Markdown renderer (operates on already-escaped text).
+ * @param {string} raw
+ * @returns {string}
+ */
+function renderInline(raw) {
+	/** @type {string[]} */
+	const codes = []
+	let out = sanitizeHtml(raw).replace(/`([^`]+)`/g, (_, code) => {
+		codes.push(`<code>${code}</code>`)
+		return `\u0001${codes.length - 1}\u0001`
+	})
+	out = out
+		.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g, (_, alt, src, title) =>
+			`<img src="${markdownHref(src)}" alt="${alt}"${title ? ` title="${title}"` : ''} />`,
+		)
+		.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g, (_, label, href, title) =>
+			`<a href="${markdownHref(href)}"${title ? ` title="${title}"` : ''}>${label}</a>`,
+		)
+		.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+		.replace(/__([^_]+)__/g, '<strong>$1</strong>')
+		.replace(/(^|[^*])\*([^*]+)\*/g, '$1<em>$2</em>')
+		.replace(/~~([^~]+)~~/g, '<del>$1</del>')
+	return out.replace(/\u0001(\d+)\u0001/g, (_, i) => codes[Number(i)])
+}
+/**
+ * Zero-dependency Markdown renderer used when `marked`/`markdown-it` are not
+ * installed. Covers headings, paragraphs, lists, blockquotes, fenced code,
+ * inline code, links, images, emphasis and horizontal rules.
+ * @param {string} md
+ * @returns {string}
+ */
+export function renderMarkdownBuiltin(md) {
+	const lines = String(md ?? '')
+		.replace(/\r\n/g, '\n')
+		.split('\n')
+	/** @type {string[]} */
+	const out = []
+	/** @type {string[]} */
+	let paragraph = []
+	const flush = () => {
+		if (paragraph.length > 0) {
+			out.push(`<p>${renderInline(paragraph.join('\n'))}</p>`)
+			paragraph = []
+		}
+	}
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i]
+		if (line.trim() === '') {
+			flush()
+			continue
+		}
+		const fence = /^\s*```+\s*([\w+-]*)\s*$/.exec(line)
+		if (fence) {
+			flush()
+			/** @type {string[]} */
+			const code = []
+			for (i++; i < lines.length && !/^\s*```+\s*$/.test(lines[i]); i++) {
+				code.push(lines[i])
+			}
+			const lang = fence[1]
+			out.push(
+				`<pre><code${lang ? ` class="language-${escapeAttribute(lang)}"` : ''}>${sanitizeHtml(code.join('\n'))}</code></pre>`,
+			)
+			continue
+		}
+		const heading = /^(#{1,6})\s+(.*)$/.exec(line)
+		if (heading) {
+			flush()
+			const level = heading[1].length
+			out.push(`<h${level}>${renderInline(heading[2])}</h${level}>`)
+			continue
+		}
+		if (/^\s*(?:---+|\*\*\*+|___+)\s*$/.test(line)) {
+			flush()
+			out.push('<hr />')
+			continue
+		}
+		if (/^\s*>\s?/.test(line)) {
+			flush()
+			/** @type {string[]} */
+			const quoted = []
+			while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
+				quoted.push(lines[i].replace(/^\s*>\s?/, ''))
+				i++
+			}
+			i--
+			out.push(`<blockquote>${renderInline(quoted.join('\n'))}</blockquote>`)
+			continue
+		}
+		if (/^\s*[-*+]\s+/.test(line)) {
+			flush()
+			/** @type {string[]} */
+			const items = []
+			while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) {
+				items.push(
+					`<li>${renderInline(lines[i].replace(/^\s*[-*+]\s+/, ''))}</li>`,
+				)
+				i++
+			}
+			i--
+			out.push(`<ul>\n${items.join('\n')}\n</ul>`)
+			continue
+		}
+		if (/^\s*\d+\.\s+/.test(line)) {
+			flush()
+			/** @type {string[]} */
+			const items = []
+			while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+				items.push(
+					`<li>${renderInline(lines[i].replace(/^\s*\d+\.\s+/, ''))}</li>`,
+				)
+				i++
+			}
+			i--
+			out.push(`<ol>\n${items.join('\n')}\n</ol>`)
+			continue
+		}
+		paragraph.push(line)
+	}
+	flush()
+	return out.join('\n')
+}
+/**
+ * Renders Markdown using `marked`, `markdown-it`, or the builtin fallback.
+ * @param {string} md
+ * @param {{ renderer?: string, rootPath?: string, markedOptions?: any, markdownItOptions?: any }} [opts]
+ * @returns {string}
+ */
+export function renderMarkdown(md, opts = {}) {
+	const renderer = opts.renderer ?? 'auto'
+	if (renderer === 'auto' || renderer === 'marked') {
+		const mod = resolveOptional('marked', opts.rootPath)
+		const marked = mod?.marked ?? mod
+		if (marked && typeof marked.parse === 'function') {
+			const rendered = marked.parse(md, opts.markedOptions ?? {})
+			if (typeof rendered === 'string') {
+				return rendered
+			}
+		}
+	}
+	if (renderer === 'auto' || renderer === 'markdown-it') {
+		const mod = resolveOptional('markdown-it', opts.rootPath)
+		const MarkdownIt = mod?.default ?? mod
+		if (typeof MarkdownIt === 'function') {
+			return new MarkdownIt(opts.markdownItOptions ?? {}).render(md)
+		}
+	}
+	return renderMarkdownBuiltin(md)
+}
+/**
+ * Converts a glob to a RegExp (`**`, `*`, `?` are supported).
+ * @param {string} pattern
+ * @returns {RegExp}
+ */
+export function globToRegExp(pattern) {
+	let re = '^'
+	for (let i = 0; i < pattern.length; i++) {
+		const c = pattern[i]
+		if (c === '*') {
+			if (pattern[i + 1] === '*') {
+				i++
+				if (pattern[i + 1] === '/') {
+					i++
+					re += '(?:.*/)?'
+				} else {
+					re += '.*'
+				}
+			} else {
+				re += '[^/]*'
+			}
+		} else if (c === '?') {
+			re += '[^/]'
+		} else {
+			re += escapeRegex(c)
+		}
+	}
+	return new RegExp(re + '$')
+}
+/**
+ * Reads width/height from common image file headers (#9), avoiding a sharp
+ * dependency when only dimension inference is needed.
+ * @param {Buffer} buf
+ * @returns {{ width: number, height: number } | null}
+ */
+export function readImageSize(buf) {
+	if (!Buffer.isBuffer(buf) || buf.length < 8) {
+		return null
+	}
+	try {
+		if (
+			buf.length >= 24 &&
+			buf.subarray(1, 4).toString('latin1') === 'PNG' &&
+			buf.subarray(12, 16).toString('latin1') === 'IHDR'
+		) {
+			return {
+				width: buf.readUInt32BE(16),
+				height: buf.readUInt32BE(20),
+			}
+		}
+		if (buf[0] === 0xff && buf[1] === 0xd8) {
+			let i = 2
+			while (i + 9 < buf.length) {
+				if (buf[i] !== 0xff) {
+					i++
+					continue
+				}
+				const marker = buf[i + 1]
+				if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) {
+					return {
+						height: buf.readUInt16BE(i + 5),
+						width: buf.readUInt16BE(i + 7),
+					}
+				}
+				const len = buf.readUInt16BE(i + 2)
+				if (len < 2) {
+					break
+				}
+				i += 2 + len
+			}
+			return null
+		}
+		if (buf.subarray(0, 3).toString('latin1') === 'GIF') {
+			return {
+				width: buf.readUInt16LE(6),
+				height: buf.readUInt16LE(8),
+			}
+		}
+		if (buf.subarray(0, 4).toString('latin1') === 'RIFF' && buf.subarray(8, 12).toString('latin1') === 'WEBP') {
+			const chunk = buf.subarray(12, 16).toString('latin1')
+			if (chunk === 'VP8X') {
+				return {
+					width: 1 + buf.readUIntLE(24, 3),
+					height: 1 + buf.readUIntLE(27, 3),
+				}
+			}
+			if (chunk === 'VP8 ') {
+				return {
+					width: buf.readUInt16LE(26) & 0x3fff,
+					height: buf.readUInt16LE(28) & 0x3fff,
+				}
+			}
+			if (chunk === 'VP8L') {
+				const bits = buf.readUInt32LE(21)
+				return {
+					width: (bits & 0x3fff) + 1,
+					height: ((bits >> 14) & 0x3fff) + 1,
+				}
+			}
+		}
+		if (buf.subarray(4, 8).toString('latin1') === 'ftyp' && /ispe/.test(buf.subarray(0, Math.min(buf.length, 512)).toString('latin1'))) {
+			const idx = buf.indexOf(Buffer.from('ispe'))
+			if (idx !== -1) {
+				return {
+					width: buf.readUInt32BE(idx + 8),
+					height: buf.readUInt32BE(idx + 12),
+				}
+			}
+		}
+		if (buf.subarray(0, 200).toString('utf8').includes('<svg')) {
+			const str = buf.subarray(0, 2048).toString('utf8')
+			const viewBox = /\bviewBox\s*=\s*["'][^"']*?\s([\d.]+)\s+([\d.]+)["']/.exec(str)
+			if (viewBox) {
+				return {
+					width: Math.round(Number(viewBox[1])),
+					height: Math.round(Number(viewBox[2])),
+				}
+			}
+			const w = /\bwidth\s*=\s*["']([\d.]+)/.exec(str)
+			const h = /\bheight\s*=\s*["']([\d.]+)/.exec(str)
+			if (w && h) {
+				return {
+					width: Math.round(Number(w[1])),
+					height: Math.round(Number(h[1])),
+				}
+			}
+		}
+	} catch {}
+	return null
+}
+/**
+ * Runs `fn` over every item with a bounded concurrency (#22).
+ * @template T, R
+ * @param {T[]} items
+ * @param {number} limit
+ * @param {(item: T, index: number) => Promise<R>} fn
+ * @returns {Promise<R[]>}
+ */
+export async function mapConcurrent(items, limit, fn) {
+	/** @type {R[]} */
+	const results = new Array(items.length)
+	let next = 0
+	const worker = async () => {
+		while (true) {
+			const index = next++
+			if (index >= items.length) {
+				return
+			}
+			results[index] = await fn(items[index], index)
+		}
+	}
+	await Promise.all(
+		Array.from({ length: Math.min(Math.max(1, limit), items.length) }, worker),
+	)
+	return results
+}
+/**
+ * Formats a byte count for build reports.
+ * @param {number} bytes
+ * @returns {string}
+ */
+export function formatBytes(bytes) {
+	if (bytes < 1024) {
+		return `${bytes}B`
+	}
+	if (bytes < 1024 * 1024) {
+		return `${(bytes / 1024).toFixed(1)}KB`
+	}
+	return `${(bytes / (1024 * 1024)).toFixed(2)}MB`
+}
+/**
+ * Maps common file extensions to MIME types without a mandatory dependency.
+ * @param {string} ext Extension without a leading dot
+ * @returns {string}
+ */
+export function mimeForExt(ext) {
+	/** @type {Record<string, string>} */
+	const map = {
+		html: 'text/html; charset=utf-8',
+		htm: 'text/html; charset=utf-8',
+		css: 'text/css; charset=utf-8',
+		js: 'text/javascript; charset=utf-8',
+		mjs: 'text/javascript; charset=utf-8',
+		cjs: 'text/javascript; charset=utf-8',
+		json: 'application/json; charset=utf-8',
+		xml: 'application/xml; charset=utf-8',
+		txt: 'text/plain; charset=utf-8',
+		svg: 'image/svg+xml',
+		png: 'image/png',
+		jpg: 'image/jpeg',
+		jpeg: 'image/jpeg',
+		gif: 'image/gif',
+		webp: 'image/webp',
+		avif: 'image/avif',
+		ico: 'image/x-icon',
+		woff: 'font/woff',
+		woff2: 'font/woff2',
+		ttf: 'font/ttf',
+		pdf: 'application/pdf',
+		mp4: 'video/mp4',
+		webm: 'video/webm',
+		wasm: 'application/wasm',
+		map: 'application/json; charset=utf-8',
+	}
+	return map[String(ext).toLowerCase()] ?? 'application/octet-stream'
+}
+/**
+ * Recursively lists files under a directory as POSIX-relative paths.
+ * @param {string} dir
+ * @returns {Promise<string[]>}
+ */
+export async function listFilesRecursive(dir) {
+	/** @type {string[]} */
+	const files = []
+	/** @type {string[]} */
+	const stack = ['']
+	while (stack.length > 0) {
+		const relDir = /** @type {string} */ (stack.pop())
+		let dirents = []
+		try {
+			dirents = await fs.readdir(pathUtil.join(dir, relDir), {
+				withFileTypes: true,
+			})
+		} catch {
+			continue
+		}
+		for (const dirent of dirents) {
+			const rel = toPosixPath(pathUtil.join(relDir, dirent.name))
+			if (dirent.isDirectory()) {
+				stack.push(rel)
+			} else if (dirent.isFile()) {
+				files.push(rel)
+			}
+		}
+	}
+	return files
+}
+/**
+ * True when a MIME type benefits from HTTP compression (#14).
+ * @param {string} mime
+ * @returns {boolean}
+ */
+export function shouldCompress(mime) {
+	return /^(text\/|application\/(json|javascript|xml|rdf\+xml|xhtml\+xml)|image\/svg\+xml)/i.test(
+		mime,
+	)
+}
+/**
+ * Normalizes a URL-style path: POSIX separators, exactly one leading slash.
+ * @param {string} path
+ * @returns {string}
+ */
+export function normalizeUrlPath(path) {
+	return '/' + toPosixPath(String(path)).replace(/^\/+/, '')
+}
+/**
+ * Sends a Buffer or file with ETag/304, Range and content-encoding support
+ * (#13/#14). Shared by the dev server and `preview()`.
+ *
+ * @param {any} res
+ * @param {any} req
+ * @param {{ body?: Buffer | string, filePath?: string, stat?: import('node:fs').Stats, mime?: string, headers?: Record<string, string>, etag?: string, cacheControl?: string, status?: number }} opts
+ * @returns {Promise<void>}
+ */
+export async function sendContent(res, req, opts) {
+	const mime = opts.mime ?? 'application/octet-stream'
+	const status = opts.status ?? 200
+	/** @type {Buffer | null} */
+	let body = null
+	/** @type {string | null} */
+	let filePath = opts.filePath ?? null
+	let size = 0
+	let etag = opts.etag ?? ''
+	if (opts.body != null) {
+		body = Buffer.isBuffer(opts.body)
+			? opts.body
+			: Buffer.from(String(opts.body))
+		size = body.length
+		etag = etag || `"${contentHash(body)}-${size.toString(36)}"`
+	} else {
+		const stat = opts.stat ?? (await fs.stat(/** @type {string} */ (filePath)))
+		size = stat.size
+		etag = etag || `"${Math.floor(stat.mtimeMs).toString(36)}-${size.toString(36)}"`
+	}
+	/** @type {Record<string, string>} */
+	const headers = {
+		...(opts.headers ?? {}),
+		'Content-Type': mime,
+		'Accept-Ranges': 'bytes',
+		ETag: etag,
+	}
+	if (opts.cacheControl) {
+		headers['Cache-Control'] = opts.cacheControl
+	}
+	const inm = req.headers?.['if-none-match']
+	if (
+		typeof inm === 'string' &&
+		inm.split(',').some((tag) => tag.trim().replace(/^W\//, '') === etag.replace(/^W\//, ''))
+	) {
+		res.writeHead(304, headers)
+		res.end()
+		return
+	}
+	// Range requests (#13): bytes=start-end, bytes=start-, bytes=-suffix.
+	const rangeHeader = req.headers?.range
+	/** @type {{ start: number, end: number } | null} */
+	let range = null
+	if (typeof rangeHeader === 'string' && /^bytes=/.test(rangeHeader)) {
+		const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim())
+		if (match) {
+			let start = match[1] === '' ? 0 : Number(match[1])
+			let end = match[2] === '' ? size - 1 : Number(match[2])
+			if (match[1] === '' && match[2] !== '') {
+				start = Math.max(0, size - Number(match[2]))
+				end = size - 1
+			}
+			if (size > 0 && start <= end && start < size) {
+				range = { start, end: Math.min(end, size - 1) }
+			}
+		}
+		if (range == null) {
+			res.writeHead(416, { ...headers, 'Content-Range': `bytes */${size}` })
+			res.end()
+			return
+		}
+		headers['Content-Range'] = `bytes ${range.start}-${range.end}/${size}`
+	}
+	if (range != null) {
+		headers['Content-Length'] = String(range.end - range.start + 1)
+		res.writeHead(206, headers)
+		if (req.method === 'HEAD') {
+			res.end()
+			return
+		}
+		if (body != null) {
+			res.end(body.subarray(range.start, range.end + 1))
+		} else {
+			await pipeline(
+				fsSync.createReadStream(/** @type {string} */ (filePath), {
+					start: range.start,
+					end: range.end,
+				}),
+				res,
+			)
+		}
+		return
+	}
+	// Compression (#14). Range responses are never compressed.
+	const acceptEncoding = String(req.headers?.['accept-encoding'] ?? '')
+	let encoding = null
+	if (shouldCompress(mime) && size > 0 && size < 16 * 1024 * 1024) {
+		if (/\bbr\b/.test(acceptEncoding) && typeof zlib.brotliCompressSync === 'function') {
+			encoding = 'br'
+		} else if (/\bgzip\b/.test(acceptEncoding)) {
+			encoding = 'gzip'
+		}
+	}
+	if (encoding != null) {
+		if (body == null && filePath != null) {
+			body = await fs.readFile(filePath)
+		}
+		const compressed =
+			encoding === 'br'
+				? zlib.brotliCompressSync(/** @type {Buffer} */ (body))
+				: zlib.gzipSync(/** @type {Buffer} */ (body))
+		headers['Content-Encoding'] = encoding
+		headers['Vary'] = 'Accept-Encoding'
+		headers['Content-Length'] = String(compressed.length)
+		res.writeHead(status, headers)
+		if (req.method !== 'HEAD') {
+			res.end(compressed)
+		} else {
+			res.end()
+		}
+		return
+	}
+	headers['Content-Length'] = String(size)
+	res.writeHead(status, headers)
+	if (req.method === 'HEAD') {
+		res.end()
+		return
+	}
+	if (body != null) {
+		res.end(body)
+	} else {
+		await pipeline(
+			fsSync.createReadStream(/** @type {string} */ (filePath)),
+			res,
+		)
+	}
+}
+/* ----------------------------------------------------------------------
+ * Feeds, robots, head and accessibility (#7/#8/#30/#33)
+ * -------------------------------------------------------------------- */
+/**
+ * Escapes a value for XML text content.
+ * @param {unknown} value
+ * @returns {string}
+ */
+export function escapeXml(value) {
+	return sanitizeHtml(String(value ?? ''))
+}
+/**
+ * Builds an RSS 2.0, Atom 1.0 or JSON Feed 1.1 document (#8).
+ * @param {{ format?: 'rss' | 'atom' | 'json', title?: string, description?: string, baseUrl?: string, path?: string, language?: string, author?: string, entries?: any[], url?: (entry: any) => string }} options
+ * @returns {string}
+ */
+export function buildFeed(options = {}) {
+	const format = options.format ?? 'rss'
+	const base = (options.baseUrl ?? '').replace(/\/+$/, '')
+	const feedPath = options.path ?? '/feed.xml'
+	const title = options.title ?? 'Feed'
+	const description = options.description ?? ''
+	const entries = options.entries ?? []
+	const selfUrl = base + feedPath
+	/** @type {{ url: string, title: string, html: string, summary: string, date: string, id: string }[]} */
+	const items = entries.map((entry) => {
+		const url =
+			typeof options.url === 'function'
+				? options.url(entry)
+				: entry.url ?? `${base}/${String(entry.slug ?? '').replace(/^\/+/, '')}`
+		return {
+			url: url.startsWith('http') ? url : base + normalizeUrlPath(url),
+			title: String(entry.title ?? entry.data?.title ?? entry.slug ?? ''),
+			html: String(entry.html ?? ''),
+			summary: stripHtml(String(entry.description ?? entry.data?.description ?? entry.html ?? '')),
+			date: String(entry.date ?? entry.data?.date ?? ''),
+			id: String(entry.slug ?? url),
+		}
+	})
+	if (format === 'json') {
+		return JSON.stringify(
+			{
+				version: 'https://jsonfeed.org/version/1.1',
+				title,
+				description,
+				home_page_url: base || undefined,
+				feed_url: selfUrl || undefined,
+				language: options.language,
+				items: items.map((item) => ({
+					id: item.id,
+					url: item.url,
+					title: item.title,
+					summary: item.summary,
+					content_html: item.html,
+					date_published: /^\d{4}-\d{2}-\d{2}/.test(item.date)
+						? new Date(item.date).toISOString()
+						: undefined,
+				})),
+			},
+			null,
+			2,
+		) + '\n'
+	}
+	if (format === 'atom') {
+		const xmlEntries = items
+			.map(
+				(item) =>
+					`  <entry>\n    <title>${escapeXml(item.title)}</title>\n    <id>${escapeXml(item.id)}</id>\n    <link href="${escapeAttribute(item.url)}" />\n${item.date ? `    <updated>${escapeXml(item.date)}</updated>\n` : ''}    <summary>${escapeXml(item.summary)}</summary>\n    <content type="html">${escapeXml(item.html)}</content>\n  </entry>`,
+			)
+			.join('\n')
+		return `<?xml version="1.0" encoding="UTF-8"?>\n<feed xmlns="http://www.w3.org/2005/Atom">\n  <title>${escapeXml(title)}</title>\n  <subtitle>${escapeXml(description)}</subtitle>\n  <link href="${escapeAttribute(selfUrl)}" rel="self" />\n  <id>${escapeXml(base || title)}</id>\n  <updated>${new Date().toISOString()}</updated>\n${options.author ? `  <author><name>${escapeXml(options.author)}</name></author>\n` : ''}${xmlEntries}\n</feed>\n`
+	}
+	const xmlEntries = items
+		.map(
+			(item) =>
+				`    <item>\n      <title>${escapeXml(item.title)}</title>\n      <link>${escapeXml(item.url)}</link>\n      <guid>${escapeXml(item.url)}</guid>\n${item.date ? `      <pubDate>${escapeXml(item.date)}</pubDate>\n` : ''}      <description>${escapeXml(item.summary)}</description>\n      <content:encoded><![CDATA[${item.html}]]></content:encoded>\n    </item>`,
+		)
+		.join('\n')
+	return `<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:atom="http://www.w3.org/2005/Atom">\n  <channel>\n    <title>${escapeXml(title)}</title>\n    <link>${escapeXml(base)}</link>\n    <description>${escapeXml(description)}</description>\n${options.language ? `    <language>${escapeXml(options.language)}</language>\n` : ''}    <atom:link href="${escapeAttribute(selfUrl)}" rel="self" type="application/rss+xml" />\n${xmlEntries}\n  </channel>\n</rss>\n`
+}
+/**
+ * Builds a `robots.txt` document (#8).
+ * @param {{ sitemap?: boolean | string, disallow?: string[], allow?: string[], userAgent?: string, host?: string, extra?: string[] }} [options]
+ * @returns {string}
+ */
+export function buildRobots(options = {}) {
+	const lines = [`User-agent: ${options.userAgent ?? '*'}`]
+	for (const path of options.allow ?? []) {
+		lines.push(`Allow: ${path}`)
+	}
+	for (const path of options.disallow ?? []) {
+		lines.push(`Disallow: ${path}`)
+	}
+	if (options.sitemap) {
+		const url =
+			typeof options.sitemap === 'string'
+				? options.sitemap
+				: options.host
+					? `${options.host.replace(/\/+$/, '')}/sitemap.xml`
+					: '/sitemap.xml'
+		lines.push(`Sitemap: ${url}`)
+	}
+	if (options.host) {
+		lines.push(`Host: ${options.host}`)
+	}
+	for (const line of options.extra ?? []) {
+		lines.push(line)
+	}
+	return lines.join('\n') + '\n'
+}
+/**
+ * Renders collected `<Head>` fragments into head tags (#7/#30).
+ * @param {Record<string, any>} head
+ * @param {{ baseUrl?: string, path?: string, locales?: string[], defaultLocale?: string, locale?: string | null, ogImage?: string | null, urlForLocale?: (locale: string, path: string) => string }} [opts]
+ * @returns {string}
+ */
+export function renderHeadTags(head, opts = {}) {
+	/** @type {string[]} */
+	const tags = []
+	const base = (opts.baseUrl ?? '').replace(/\/+$/, '')
+	const path = opts.path ?? '/'
+	if (head.title != null) {
+		tags.push(`<title>${sanitizeHtml(String(head.title))}</title>`)
+	}
+	if (head.description != null) {
+		tags.push(
+			`<meta name="description" content="${escapeAttribute(head.description)}" />`,
+		)
+	}
+	if (head.robots != null) {
+		tags.push(
+			`<meta name="robots" content="${escapeAttribute(head.robots)}" />`,
+		)
+	}
+	/** @type {{ name?: string, property?: string, 'http-equiv'?: string, charset?: string, content?: string }[]} */
+	const meta = head.meta ?? []
+	for (const entry of Array.isArray(meta) ? meta : []) {
+		if (entry.charset) {
+			tags.push(`<meta charset="${escapeAttribute(entry.charset)}" />`)
+		} else if (entry['http-equiv']) {
+			tags.push(
+				`<meta http-equiv="${escapeAttribute(entry['http-equiv'])}" content="${escapeAttribute(entry.content)}" />`,
+			)
+		} else if (entry.name || entry.property) {
+			tags.push(
+				`<meta ${entry.property ? 'property' : 'name'}="${escapeAttribute(entry.property ?? entry.name)}" content="${escapeAttribute(entry.content)}" />`,
+			)
+		}
+	}
+	const og = head.og ?? {}
+	const ogValues = {
+		'og:title': og.title ?? head.title,
+		'og:type': og.type ?? (path === '/' ? 'website' : 'article'),
+		'og:url': og.url ?? (base ? base + path : ''),
+		'og:image': og.image ?? opts.ogImage ?? head.image,
+		'og:description': og.description ?? head.description,
+		'og:site_name': og.siteName,
+		'og:locale': og.locale ?? opts.locale,
+		'twitter:card': og.twitterCard ?? 'summary_large_image',
+		'twitter:title': og.twitterTitle ?? og.title ?? head.title,
+		'twitter:image': og.twitterImage ?? og.image ?? opts.ogImage ?? head.image,
+	}
+	const hasOgIntent =
+		head.title != null ||
+		head.description != null ||
+		head.image != null ||
+		opts.ogImage != null ||
+		Object.keys(og).length > 0
+	const emitOg =
+		hasOgIntent && Object.values(ogValues).some((v) => v != null && v !== '')
+	if (emitOg) {
+		for (const [key, value] of Object.entries(ogValues)) {
+			if (value != null && value !== '') {
+				tags.push(
+					`<meta property="${escapeAttribute(key)}" content="${escapeAttribute(value)}" />`,
+				)
+			}
+		}
+	}
+	const canonical = head.canonical ?? (base ? base + path : null)
+	if (head.canonical !== false && canonical) {
+		tags.push(
+			`<link rel="canonical" href="${escapeAttribute(canonical)}" />`,
+		)
+	}
+	if ((opts.locales?.length ?? 0) > 1) {
+		for (const locale of /** @type {string[]} */ (opts.locales)) {
+			const href =
+				typeof opts.urlForLocale === 'function'
+					? opts.urlForLocale(locale, path)
+					: base +
+						(locale === opts.defaultLocale ? '' : `/${locale}`) +
+						path
+			tags.push(
+				`<link rel="alternate" hreflang="${escapeAttribute(locale)}" href="${escapeAttribute(href)}" />`,
+			)
+		}
+		tags.push(
+			`<link rel="alternate" hreflang="x-default" href="${escapeAttribute(base + path)}" />`,
+		)
+	}
+	for (const link of head.links ?? []) {
+		const attrs = Object.entries(link)
+			.map(([k, v]) => `${k}="${escapeAttribute(v)}"`)
+			.join(' ')
+		tags.push(`<link ${attrs} />`)
+	}
+	if (head.jsonLd != null) {
+		tags.push(
+			`<script type="application/ld+json">${JSON.stringify(head.jsonLd).replace(/</g, '\\u003c')}</script>`,
+		)
+	}
+	return tags.join('\n')
+}
+/**
+ * Lightweight development-mode accessibility checks (#33).
+ * @param {string} htmlStr
+ * @returns {string[]}
+ */
+export function checkAccessibility(htmlStr) {
+	/** @type {string[]} */
+	const warnings = []
+	const htmlTag = /<html\b[^>]*>/i.exec(htmlStr)
+	if (htmlTag && !/\blang\s*=/i.test(htmlTag[0])) {
+		warnings.push('<html> is missing a lang attribute')
+	}
+	for (const match of htmlStr.matchAll(/<img\b[^>]*>/gi)) {
+		if (!/\balt\s*=/i.test(match[0])) {
+			warnings.push(`<img> without alt: ${match[0].slice(0, 80)}`)
+		}
+	}
+	/** @type {Set<string>} */
+	const ids = new Set()
+	for (const match of htmlStr.matchAll(/\bid\s*=\s*["']([^"']+)["']/gi)) {
+		if (ids.has(match[1])) {
+			warnings.push(`duplicate id="${match[1]}"`)
+		}
+		ids.add(match[1])
+	}
+	if (/<html\b/i.test(htmlStr) && !/<title\b/i.test(htmlStr)) {
+		warnings.push('document has no <title>')
+	}
+	return warnings
+}
+/**
+ * Injects head tags into an HTML document.
+ * @param {string} htmlStr
+ * @param {string} headTags
+ * @returns {string}
+ */
+export function injectHead(htmlStr, headTags) {
+	if (headTags.trim() === '') {
+		return htmlStr
+	}
+	const openHead = /<head\b[^>]*>/i.exec(htmlStr)
+	if (openHead) {
+		const at = openHead.index + openHead[0].length
+		return (
+			htmlStr.slice(0, at) + '\n' + headTags + '\n' + htmlStr.slice(at)
+		)
+	}
+	const openHtml = /<html\b[^>]*>/i.exec(htmlStr)
+	if (openHtml) {
+		const at = openHtml.index + openHtml[0].length
+		return (
+			htmlStr.slice(0, at) +
+			`\n<head>\n${headTags}\n</head>\n` +
+			htmlStr.slice(at)
+		)
+	}
+	return `<head>\n${headTags}\n</head>\n` + htmlStr
+}
+
 /**
  * Manager for client-side behaviors and modules.
  *
@@ -254,7 +1732,7 @@ function parseQuotedString(raw) {
  */
 class ClientManager {
 	/**
-     * @typedef {{ type: 'plain' } | { type: 'behavior', rewrittenContent: string, rewrittenPath: string }} LoadedModule
+     * @typedef {{ type: 'plain' } | { type: 'behavior', rewrittenContent: string, rewrittenPath: string, styles?: string, load?: string }} LoadedModule
       A loaded module object either contains a plain JS module that can be copied/served verbatim, or a behavior module's rewritten source and path.
      */
 	/**
@@ -294,6 +1772,18 @@ class ClientManager {
 	 * @type {Set<Promise<any>>}
 	 */
 	#loadingModules = /** @type {Set<Promise<any>>} */ (new Set())
+	/**
+	 * Modules already emitted as pages/static files. Shared dependencies are
+	 * registered exactly once per generation (#19/#24).
+	 * @type {Set<string>}
+	 */
+	#emittedModules = new Set()
+	/**
+	 * When enabled, imports inside rewritten behavior modules point at one
+	 * canonical absolute URL instead of a per-module relative path (#19).
+	 * @type {boolean}
+	 */
+	#absoluteImports = false
 	/**
 	 * Creates a new client manager.
 	 * @param {Wunphile} wunphile The Wunphile instance
@@ -364,10 +1854,18 @@ class ClientManager {
 			// (relative to the Wunphile root). pathUtil.relative('./', ...)
 			// was relative to the CWD and produced a wrong path whenever
 			// CWD !== project root.
-			this.#wunphile.staticFile(
-				CLIENT_MOUNT_PREFIX + relativePath,
-				pathUtil.relative(this.#getProjectRootPath(), modPath),
-			)
+			// #19: shared dependencies are emitted once per generation.
+			if (!this.#emittedModules.has(relativePath)) {
+				this.#emittedModules.add(relativePath)
+				this.#wunphile.staticFile(
+					CLIENT_MOUNT_PREFIX + relativePath,
+					pathUtil.relative(this.#getProjectRootPath(), modPath),
+				)
+			}
+			const noteDep = /** @type {any} */ (this.#wunphile).noteModuleDependency
+			if (typeof noteDep === 'function') {
+				noteDep.call(this.#wunphile, relativePath)
+			}
 			return
 		}
 		// This is a behavior module.
@@ -433,6 +1931,13 @@ class ClientManager {
 				)
 				if (!relativeToModDir.startsWith('.')) {
 					relativeToModDir = './' + relativeToModDir
+				}
+				// #19: optionally route every dependency through one canonical
+				// absolute URL so the browser deduplicates shared modules.
+				if (this.#absoluteImports) {
+					relativeToModDir =
+						CLIENT_MOUNT_PREFIX +
+						relPosix(this.rootPath, fullImportPath)
 				}
 				// Resolve the imports string.
 				if (importsRaw != null) {
@@ -513,6 +2018,20 @@ class ClientManager {
 				}
 				out += '    },\n'
 			}
+			// #21: ship CSS with the module so the loader can adopt it without
+			// an extra request. #20: modules may declare a default load strategy.
+			out +=
+				'    styles: ' +
+				(behaviorMod.styles == null
+					? 'undefined'
+					: JSON.stringify(behaviorMod.styles)) +
+				',\n'
+			out +=
+				'    load: ' +
+				(behaviorMod.load == null
+					? 'undefined'
+					: JSON.stringify(behaviorMod.load)) +
+				',\n'
 			out += '}\n'
 			let modOutPath = behaviorModPath
 			if (isTypeScript) {
@@ -538,9 +2057,18 @@ class ClientManager {
 				type: 'behavior',
 				rewrittenContent: out,
 				rewrittenPath,
+				styles: behaviorMod.styles,
+				load: behaviorMod.load,
 			})
-			this.#wunphile.pageRaw(CLIENT_MOUNT_PREFIX + rewrittenPath, out)
-		})()
+			if (!this.#emittedModules.has(rewrittenPath)) {
+				this.#emittedModules.add(rewrittenPath)
+				this.#wunphile.pageRaw(CLIENT_MOUNT_PREFIX + rewrittenPath, out)
+			}
+			const noteDep = /** @type {any} */ (this.#wunphile).noteModuleDependency
+			if (typeof noteDep === 'function') {
+				noteDep.call(this.#wunphile, rewrittenPath)
+			}
+			})()
 		this.#processingModules.set(loadedModKey, loaderProm)
 		await loaderProm
 	}
@@ -585,62 +2113,52 @@ class ClientManager {
 	}
 	/**
 	 * Generates a loader script for the specified rewritten relative paths to behavior modules.
-	 * The script is a JS module that imports the scripts on the browser.
-	 * The scripts can also be preloaded, but this function only generates the loader JavaScript, not the HTML script tag for it.
+	 * Delegates to the pure {@link generateLoaderScript} export (#39).
 	 *
-	 * BUG 2 FIX: Previously, the import statements were concatenated with no
-	 * separator. Without a line terminator, ASI does not apply and the browser
-	 * reports a SyntaxError. We now join with `;\n`.
+	 * The historical `break break` syntax error and the misplaced closing
+	 * brace in `hydrate()` (#18) are gone: the runtime is now a single tested
+	 * string shared by both loader strategies.
 	 *
-	 * Additionally, paths are now embedded with `JSON.stringify()` so any
-	 * special characters are safely escaped inside the JS string literal
-	 * (defense-in-depth against issue #3).
-	 *
-	 * @param {string[]} rewrittenRelativePaths The rewritten relative paths to behavior modules (POSIX-style)
+	 * @param {(string | LoaderDescriptor | { path: string, load?: LoadStrategy, styles?: string })[]} rewrittenRelativePaths
+	 * @param {{ strategy?: 'dynamic' | 'static', base?: string }} [opts]
 	 * @returns {string} The loader script
 	 */
-	generateLoaderScript(rewrittenRelativePaths) {
-		if (rewrittenRelativePaths.length === 0) {
-			return ''
-		}
-		// Dedupe: N usages of the same module should produce a single import.
-		const paths = /** @type {Set<string>} */ (
-			new Set(rewrittenRelativePaths.map(toPosixPath))
-		)
-		const hydrateScript = `
-function hydrate(mod, path) {
-    const comment = ${JSON.stringify(CLIENT_BEHAVIOR_HYDRATE_PREFIX)} + path
-    
-    const treeWalker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_COMMENT)
-    let node
-    while ((node = treeWalker.nextNode())) {
-        if (node.nodeType === Node.COMMENT_NODE && node.textContent === comment) {
-            // Find next element.
-            let elem
-            let nextNode = node
-            while ((nextNode = treeWalker.nextNode())) {
-                if (nextNode.nodeType === Node.ELEMENT_NODE) {
-                    elem = nextNode
-                    break												break
-                }
-                }
-            
-            if (elem) {
-                mod.behavior(elem)
-            }
-        }
-    }
-}
-        `.trim()
-		// BUG 2 FIX: Join statements with ';\n' so ASI is not relied upon.
-		// Use JSON.stringify for safe embedding in a JS string literal.
-		const stmts = []
-		for (const path of paths) {
-			stmts.push(
-				`import(${JSON.stringify(CLIENT_MOUNT_PREFIX + path)}).then(mod => hydrate(mod.default, ${JSON.stringify(path)}))`,
+	generateLoaderScript(rewrittenRelativePaths, opts = {}) {
+		return generateLoaderScript(rewrittenRelativePaths, opts)
+	}
+	/**
+	 * Enables canonical absolute import URLs for shared dependencies (#19).
+	 * @param {boolean} enabled
+	 */
+	setAbsoluteImports(enabled) {
+		this.#absoluteImports = enabled
+	}
+	/**
+	 * Drops all per-generation caches (#24). Called on every hot reload so a
+	 * long-running dev server does not accumulate rewritten modules.
+	 */
+	newGeneration() {
+		this.loadedModules.clear()
+		this.#processingModules.clear()
+		this.#loadingModules.clear()
+		this.#emittedModules.clear()
+	}
+	/**
+	 * Content fingerprints of every loaded module, used by incremental
+	 * builds to hash a page's dependency graph (#23).
+	 * @returns {string[]}
+	 */
+	moduleFingerprints() {
+		/** @type {string[]} */
+		const out = []
+		for (const [key, info] of this.loadedModules) {
+			out.push(
+				info.type === 'behavior'
+					? `${key}:${contentHash(info.rewrittenContent)}`
+					: key,
 			)
 		}
-		return hydrateScript + '\n' + stmts.join(';\n')
+		return out.sort()
 	}
 }
 // REFACTOR: Class documentation and examples use the canonical
@@ -722,6 +2240,89 @@ export class Wunphile {
 	 * @type {number}
 	 */
 	#lastReload = -1
+	/* ---- New feature state ------------------------------------------- */
+	/** @type {string} URL prefix for subdirectory deployments (#26). */
+	#base = ''
+	/** @type {string | null} Absolute origin for canonical/feeds (#30). */
+	#baseUrl = null
+	/** @type {Map<string, any>} Per-page sitemap/SEO metadata (#31). */
+	#pageMeta = new Map()
+	/** @type {Map<string, any>} Dynamic page registrations (#6). */
+	#dynamicPages = new Map()
+	/** @type {Array<() => any[] | Promise<any[]>>} getStaticPaths providers (#6). */
+	#staticPathsProviders = []
+	/** @type {Map<string, ContentEntry[]>} Named content collections (#5). */
+	#collections = new Map()
+	/** @type {any} Markdown renderer configuration. */
+	#markdownOptions = {}
+	/** @type {any} Shared content collection options. */
+	#contentOptions = {}
+	/** @type {any} Image pipeline options (#9). */
+	#imageOptions = null
+	/** @type {Map<string, Array<(content: string, ctx: any) => any>>} Asset transforms (#2). */
+	#transformHooks = new Map()
+	/** @type {Map<string, StaticOptions>} */
+	#staticFileOptions = new Map()
+	/** @type {Map<string, StaticOptions>} */
+	#staticDirOptions = new Map()
+	/** @type {Map<string, string>} original URL -> fingerprinted URL (#1). */
+	#assetManifest = new Map()
+	/** @type {Map<string, any>} Final URL -> asset record (#1/#2). */
+	#assets = new Map()
+	/** @type {any[]} Responsive image variants to generate (#9). */
+	#imageVariants = []
+	/** @type {any | null} OG image options (#10). */
+	#ogImageOptions = null
+	/** @type {Map<string, Buffer>} og URL -> generated SVG/PNG content. */
+	#ogImages = new Map()
+	/** @type {any[]} Feed registrations (#8). */
+	#feeds = []
+	/** @type {any | null} robots.txt options (#8). */
+	#robotsOptions = null
+	/** @type {any | null} Deploy adapter config (#11). */
+	#adapter = null
+	/** @type {Map<string, { to: string, status: number }>} Redirect records (#12). */
+	#redirects = new Map()
+	/** @type {Set<string>} Generated (non-page) paths excluded from sitemaps. */
+	#generatedPaths = new Set()
+	/** @type {any | null} i18n configuration (#32). */
+	#i18nOptions = null
+	/** @type {'dynamic' | 'static'} Client loader strategy (#18). */
+	#loaderStrategy = 'dynamic'
+	/** @type {boolean} Canonical absolute module imports (#19). */
+	#absoluteImports = false
+	/** @type {boolean} Whether CSP nonces are enabled (#36). */
+	#cspEnabled = false
+	/** @type {string} Nonce for the page currently being rendered (#36). */
+	#currentNonce = ''
+	/** @type {Plugin[]} Registered plugins (#25). */
+	#plugins = []
+	/** @type {BuildOptions} Default build options (#3/#23/#38). */
+	#buildOptions = {}
+	/** @type {Map<string, Set<string>>} Page -> module fingerprints (#23). */
+	#pageDeps = new Map()
+	/** @type {string | null} Page currently being rendered. */
+	#currentPagePath = null
+	/** @type {string | null} Last dev worker error (#15). */
+	#devError = null
+	/** @type {string[]} Dev accessibility warnings (#33). */
+	#devWarnings = []
+	/** @type {Set<any>} SSE clients (#15). */
+	#sseClients = new Set()
+	/** @type {Map<string, { key: string, html: string }>} Dev render cache (#17). */
+	#devRenderCache = new Map()
+	/** @type {Map<string, string>} Fully rendered pages received from a worker. */
+	#preRenderedContent = new Map()
+	/** @type {any | null} Last build statistics (#38). */
+	#lastStats = null
+	/** @type {any | null} Persistent incremental build cache (#23). */
+	#buildCache = null
+	/** @type {any | null} The config object passed to the constructor. */
+	#config = null
+	/** @type {Array<{ close: () => void }>} Active file watchers (#16/#28). */
+	#watchers = []
+	/** @type {((children: RenderFragments, ctx: PageContext) => RenderFragments) | null} Global layout (#7). */
+	#layoutFn = null
 	// REFACTOR: Example below uses the canonical `wunphile` name.
 	/**
 	 * Preloads a behavior module.
@@ -754,28 +2355,32 @@ export class Wunphile {
 	 * ```
 	 *
 	 * @param {string} importMetaUrl The `import.meta.url` of the program main module.
-	 * @param {string} [clientDir='./src/client'] The path to the client directory. Client behaviors must be within this directory.
+	 * @param {string | WunphileConfig} [clientDir='./src/client'] The client directory, or a config object from {@link defineConfig} (#26).
 	 *
 	 * Used to resolve the root path and for identifying the main module for hot reloading.
 	 */
 	constructor(importMetaUrl, clientDir = './src/client') {
+		const config =
+			typeof clientDir === 'object' && clientDir !== null ? clientDir : null
+		const clientDirPath =
+			config == null ? /** @type {string} */ (clientDir) : config.clientDir ?? './src/client'
 		const mainModulePath = fileURLToPath(importMetaUrl)
 		// FIX #10: Supply the project root resolver; #rootPath is assigned
 		// just below, so a lazy getter is used instead of a snapshot.
 		this.#clientManager = new ClientManager(
 			this,
-			pathUtil.join(pathUtil.dirname(mainModulePath), clientDir),
+			pathUtil.join(pathUtil.dirname(mainModulePath), clientDirPath),
 			() => this.#rootPath,
 		)
 		if (isMainThread) {
-			// Resolve paths
+			// Resolve paths. WUNPHILE_* env aliases take precedence (#26).
 			this.#mainModulePath = mainModulePath
 			this.#rootPath = pathUtil.resolve(
-				process.env[ROOT_PATH_ENV_VAR] ||
+				readEnv(ROOT_PATH_ENV_VAR) ||
 					pathUtil.dirname(fileURLToPath(importMetaUrl)),
 			)
 			this.#outputPath = pathUtil.resolve(
-				process.env[OUTPUT_PATH_ENV_VAR] ||
+				readEnv(OUTPUT_PATH_ENV_VAR) ||
 					pathUtil.join(this.#rootPath, './dist'),
 			)
 			// ==================================================================
@@ -789,7 +2394,7 @@ export class Wunphile {
 			//
 			// We now validate the raw input BEFORE any path manipulation, and
 			// store it in POSIX-normalized form. No filesystem resolution.
-			const nfRaw = process.env[NOT_FOUND_PATH_ENV_VAR] || '/404.html'
+			const nfRaw = readEnv(NOT_FOUND_PATH_ENV_VAR) || '/404.html'
 			if (!nfRaw.startsWith('/')) {
 				throw new Error(
 					'The not found page must start with a forward slash.',
@@ -803,6 +2408,1259 @@ export class Wunphile {
 			this.#outputPath = workerData.outputPath
 			this.#notFoundPath = workerData.notFoundPath
 		}
+		if (config != null) {
+			this.#config = config
+			this.applyConfig(config)
+		}
+	}
+	/**
+	 * Applies a single config object to this instance. Called by the
+	 * constructor and usable directly for `defineConfig()` (#26).
+	 * @param {WunphileConfig} config
+	 * @returns {Wunphile} This
+	 */
+	applyConfig(config) {
+		if (config == null) {
+			return this
+		}
+		if (isMainThread) {
+			if (config.root) {
+				this.#rootPath = pathUtil.resolve(config.root)
+			}
+			if (config.outDir) {
+				this.#outputPath = pathUtil.resolve(
+					this.#rootPath,
+					config.outDir,
+				)
+			}
+			if (config.notFoundPath) {
+				this.overrideNotFoundPath(config.notFoundPath)
+			}
+		}
+		if (config.clientDir) {
+			this.#clientManager.rootPath = pathUtil.resolve(
+				this.#rootPath,
+				config.clientDir,
+			)
+		}
+		if (config.base != null) {
+			this.#base = config.base.replace(/\/+$/, '')
+		}
+		if (config.baseUrl != null) {
+			this.#baseUrl = config.baseUrl.replace(/\/+$/, '')
+		}
+		if (config.minify != null) {
+			this.#minifyHtml = Boolean(config.minify)
+		}
+		if (config.sitemap != null) {
+			if (typeof config.sitemap === 'string') {
+				this.sitemap(config.sitemap)
+			} else {
+				this.sitemap(config.sitemap.baseUrl, config.sitemap.path)
+			}
+		}
+		if (config.markdown != null) {
+			this.#markdownOptions = config.markdown
+		}
+		if (config.content != null) {
+			this.#contentOptions = config.content
+		}
+		if (config.image != null) {
+			this.#imageOptions = config.image
+		}
+		if (config.i18n != null) {
+			this.i18n(config.i18n)
+		}
+		if (config.adapter != null) {
+			this.adapter(config.adapter)
+		}
+		if (config.feed != null) {
+			for (const feed of Array.isArray(config.feed) ? config.feed : [config.feed]) {
+				this.feed(feed)
+			}
+		}
+		if (config.robots != null) {
+			this.robotsTxt(config.robots)
+		}
+		if (config.ogImage != null) {
+			this.ogImage(config.ogImage)
+		}
+		if (config.loader != null) {
+			this.#loaderStrategy = /** @type {'dynamic' | 'static'} */ (
+				config.loader
+			)
+		}
+		if (config.csp != null) {
+			this.#cspEnabled = Boolean(config.csp)
+		}
+		if (config.absoluteImports != null) {
+			this.absoluteImports(config.absoluteImports)
+		}
+		if (config.build != null) {
+			this.#buildOptions = { ...this.#buildOptions, ...config.build }
+		}
+		if (config.plugins != null) {
+			this.use(...config.plugins)
+		}
+		// Content collections declared in config (#5).
+		if (this.#contentOptions.collections != null) {
+			for (const [name, opts] of Object.entries(this.#contentOptions.collections)) {
+				this.collection(name, /** @type {any} */ (opts))
+			}
+		}
+		return this
+	}
+	/* ==================================================================
+	 * Asset pipeline internals (#1, #2, #3)
+	 * ================================================================ */
+	/** @returns {Promise<any[]>} All source assets, deduplicated by URL. */
+	async #collectAssetRecords() {
+		/** @type {Map<string, any>} */
+		const records = new Map()
+		for (const [mount, dir] of this.#staticDirMappings) {
+			const dirPath = this.toProjectPath(dir)
+			const prefix = mount.replace(/\/+$/, '')
+			for (const rel of await listFilesRecursive(dirPath)) {
+				const url = normalizeUrlPath(prefix + '/' + rel)
+				records.set(url, {
+					url,
+					sourcePath: pathUtil.join(dirPath, rel),
+					options: this.#staticDirOptions.get(mount) ?? {},
+				})
+			}
+		}
+		for (const [url, file] of this.#staticFileMappings) {
+			records.set(normalizeUrlPath(url), {
+				url: normalizeUrlPath(url),
+				sourcePath: this.toProjectPath(file),
+				options: this.#staticFileOptions.get(url) ?? {},
+			})
+		}
+		for (const variant of this.#imageVariants) {
+			// Variant URLs are already content-hashed by image(), so they must
+			// not be hashed a second time here.
+			records.set(normalizeUrlPath('/' + variant.outUrl), {
+				url: normalizeUrlPath('/' + variant.outUrl),
+				sourcePath: variant.sourcePath,
+				mime: variant.mime,
+				options: {
+					headers: {
+						'Cache-Control': 'public, max-age=31536000, immutable',
+					},
+				},
+				variant,
+			})
+		}
+		return [...records.values()]
+	}
+	/**
+	 * Whether an optional minifier is installed for this extension (#2).
+	 * @param {string} ext
+	 * @returns {boolean}
+	 */
+	#hasOptionalTransform(ext) {
+		if (ext === 'css') {
+			return Boolean(resolveOptional('lightningcss', this.#rootPath)?.transform)
+		}
+		if (['js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx'].includes(ext)) {
+			return Boolean(resolveOptional('esbuild', this.#rootPath)?.transformSync)
+		}
+		return false
+	}
+	/**
+	 * Applies an optional esbuild / lightningcss transform. Absent optional
+	 * dependencies are simply skipped - Wunphile stays zero-dependency.
+	 * @param {string} text
+	 * @param {string} ext
+	 * @param {string} url
+	 * @returns {string | null}
+	 */
+	#applyOptionalTransform(text, ext, url) {
+		try {
+			if (ext === 'css') {
+				const lightning = resolveOptional('lightningcss', this.#rootPath)
+				if (lightning?.transform) {
+					return String(
+						lightning.transform({
+							filename: url,
+							code: Buffer.from(text),
+							minify: true,
+							sourceMap: false,
+						}).code,
+					)
+				}
+			}
+			if (['js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx'].includes(ext)) {
+				const esbuild = resolveOptional('esbuild', this.#rootPath)
+				if (esbuild?.transformSync) {
+					const loader = ext === 'ts' || ext === 'tsx' ? 'ts' : ext === 'jsx' ? 'jsx' : 'js'
+					return String(
+						esbuild.transformSync(text, {
+							loader,
+							minify: true,
+							format: 'esm',
+							target: 'es2022',
+						}).code,
+					)
+				}
+			}
+		} catch (err) {
+			console.warn(
+				`[wunphile] optional asset transform failed for ${url}:`,
+				err,
+			)
+		}
+		return null
+	}
+	/**
+	 * Applies registered `transformAsset` hooks, then optional transforms.
+	 * @param {string} text
+	 * @param {any} rec
+	 * @returns {Promise<string>}
+	 */
+	async #transformAssetContent(text, rec) {
+		let out = text
+		for (const fn of this.#transformHooks.get(rec.ext) ?? []) {
+			const result = await fn(out, { path: rec.url, ext: rec.ext })
+			if (result != null) {
+				out = Buffer.isBuffer(result) ? result.toString('utf8') : String(result)
+			}
+		}
+		if (rec.options.transform !== false) {
+			const transformed = this.#applyOptionalTransform(out, rec.ext, rec.url)
+			if (transformed != null) {
+				out = transformed
+			}
+		}
+		return out
+	}
+	/**
+	 * Rewrites `url(...)` references in CSS to fingerprinted paths (#2).
+	 * @param {string} css
+	 * @param {string} cssUrl
+	 * @param {Map<string, string>} manifest
+	 * @returns {string}
+	 */
+	#rewriteCssUrls(css, cssUrl, manifest) {
+		return css.replace(
+			/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi,
+			(full, quote, target) => {
+				if (/^(data:|https?:|\/\/|#|blob:)/i.test(target)) {
+					return full
+				}
+				const clean = target.split('?')[0].split('#')[0]
+				const resolved = clean.startsWith('/')
+					? normalizeUrlPath(clean)
+					: normalizeUrlPath(
+							pathUtil.posix.join(pathUtil.posix.dirname(cssUrl), clean),
+						)
+				const hashed = manifest.get(resolved)
+				if (hashed == null) {
+					return full
+				}
+				return `url(${quote}${hashed}${quote})`
+			},
+		)
+	}
+	/**
+	 * Generates an image variant with sharp, or falls back to the source.
+	 * @param {any} variant
+	 * @returns {Promise<Buffer>}
+	 */
+	async #generateImageVariant(variant) {
+		const sharp = resolveOptional('sharp', this.#rootPath)
+		if (sharp && variant.type === 'variant') {
+			let pipeline = sharp(variant.sourcePath)
+			if (variant.width) {
+				pipeline = pipeline.resize({
+					width: variant.width,
+					withoutEnlargement: true,
+				})
+			}
+			if (variant.format === 'webp' || variant.format === 'avif') {
+				pipeline = pipeline[variant.format]({
+					quality: variant.quality ?? 75,
+				})
+			} else if (variant.format === 'png' || variant.format === 'jpeg') {
+				pipeline = pipeline[variant.format]()
+			}
+			return Buffer.from(await pipeline.toBuffer())
+		}
+		return fsSync.readFileSync(variant.sourcePath)
+	}
+	/**
+	 * Reads, transforms and fingerprints every registered asset.
+	 * Also rewrites CSS `url()` references, then recomputes CSS hashes until
+	 * the manifest converges (#1/#2/#9).
+	 * @returns {Promise<void>}
+	 */
+	async #prepareAssets() {
+		const records = await this.#collectAssetRecords()
+		for (const rec of records) {
+			rec.ext = pathUtil.extname(rec.url).slice(1).toLowerCase()
+			rec.mime = rec.mime ?? mimeForExt(rec.ext)
+			rec.stat = await statOrNull(rec.sourcePath)
+			rec.hashed = rec.options.hash === true
+			const hooks = this.#transformHooks.get(rec.ext)?.length ?? 0
+			const isCss = rec.ext === 'css'
+			const needsRead =
+				rec.variant != null ||
+				rec.hashed ||
+				isCss ||
+				hooks > 0 ||
+				rec.options.transform === true ||
+				(rec.options.transform !== false && this.#hasOptionalTransform(rec.ext))
+			/** @type {Buffer | null} */
+			let content = null
+			if (rec.variant != null) {
+				content = await this.#generateImageVariant(rec.variant)
+			} else if (needsRead && rec.stat?.isFile()) {
+				const source = await fs.readFile(rec.sourcePath)
+				rec.rawSize = source.length
+				content = Buffer.from(
+					await this.#transformAssetContent(source.toString('utf8'), rec),
+				)
+			} else {
+				rec.rawSize = rec.stat?.size ?? 0
+			}
+			rec.content = content
+			rec.baseContent = content == null ? null : content.toString('utf8')
+			rec.size = content?.length ?? rec.stat?.size ?? 0
+			rec.hash = content != null ? contentHash(content) : contentHash(rec.url + String(rec.stat?.mtimeMs ?? 0))
+		}
+		/** @type {Map<string, string>} */
+		const manifest = new Map()
+		for (const rec of records) {
+			if (rec.hashed) {
+				manifest.set(rec.url, hashPath(rec.url, rec.hash))
+			}
+		}
+		const cssRecords = records.filter(
+			(rec) => rec.ext === 'css' && rec.baseContent != null,
+		)
+		for (let pass = 0; pass < 3; pass++) {
+			let changed = false
+			for (const rec of cssRecords) {
+				const rewritten = this.#rewriteCssUrls(
+					rec.baseContent,
+					rec.url,
+					manifest,
+				)
+				const buf = Buffer.from(rewritten)
+				const nextHash = contentHash(buf)
+				rec.content = buf
+				rec.size = buf.length
+				if (nextHash !== rec.hash) {
+					changed = true
+					rec.hash = nextHash
+				}
+				if (rec.hashed) {
+					manifest.set(rec.url, hashPath(rec.url, nextHash))
+				}
+			}
+			if (!changed) {
+				break
+			}
+		}
+		/** @type {Map<string, any>} */
+		const assets = new Map()
+		for (const rec of records) {
+			const finalUrl = rec.hashed
+				? /** @type {string} */ (manifest.get(rec.url))
+				: rec.url
+			assets.set(finalUrl, {
+				url: rec.url,
+				finalUrl,
+				sourcePath: rec.sourcePath,
+				content: rec.content,
+				stat: rec.stat,
+				mime: rec.mime,
+				rawSize: rec.rawSize ?? 0,
+				size: rec.size ?? 0,
+				hashed: rec.hashed,
+				headers: rec.options.headers ?? {},
+			})
+			for (const plugin of this.#plugins) {
+				if (typeof plugin.onAsset === 'function') {
+					await plugin.onAsset(assets.get(finalUrl))
+				}
+			}
+		}
+		this.#assetManifest = manifest
+		this.#assets = assets
+	}
+	/**
+	 * Validates that a URL path stays inside the output directory (#35).
+	 * @param {string} url
+	 * @returns {string} Absolute filesystem path
+	 */
+	#safeOutputPath(url) {
+		const dest = this.toOutputPath(url)
+		const rel = pathUtil.relative(this.#outputPath, dest)
+		if (
+			rel === '..' ||
+			rel.startsWith('..' + pathUtil.sep) ||
+			pathUtil.isAbsolute(rel)
+		) {
+			throw new Error(`Refusing to write outside the output directory: ${url}`)
+		}
+		return dest
+	}
+	/** @returns {Promise<void>} Writes all prepared assets. */
+	async #writeAssets() {
+		for (const rec of this.#assets.values()) {
+			if (rec.content == null && !rec.stat?.isFile()) {
+				console.warn(
+					`[wunphile] skipping missing static asset "${rec.url}" (${rec.sourcePath})`,
+				)
+				continue
+			}
+			const dest = this.#safeOutputPath(rec.finalUrl)
+			await fs.mkdir(pathUtil.dirname(dest), { recursive: true })
+			if (rec.content != null) {
+				await fs.writeFile(dest, rec.content)
+			} else if (rec.sourcePath != null) {
+				await fs.copyFile(rec.sourcePath, dest)
+			}
+		}
+	}
+	/* ==================================================================
+	 * Dynamic routes / i18n expansion (#6, #32)
+	 * ================================================================ */
+	/**
+	 * Replaces `[param]` and `[...rest]` segments in a path pattern.
+	 * @param {string} pattern
+	 * @param {Record<string, any>} params
+	 * @returns {string}
+	 */
+	#fillPathParams(pattern, params) {
+		return pattern.replace(/\[([^\]]+)\]/g, (_, key) => {
+			const name = key.startsWith('...') ? key.slice(3) : key
+			const value = params[name] ?? params.slug ?? ''
+			return encodeURIComponent(
+				String(Array.isArray(value) ? value.join('/') : value),
+			)
+		})
+	}
+	/**
+	 * Resolves getStaticPaths values for a dynamic route.
+	 * @param {any} options
+	 * @returns {Promise<Record<string, any>[]>}
+	 */
+	async #resolveParamSets(options) {
+		let source = options.paths ?? options.getStaticPaths
+		if (typeof source === 'string') {
+			source = this.#collections.get(source) ?? []
+		}
+		/** @type {any[]} */
+		let raw = []
+		if (typeof source === 'function') {
+			raw = await source({
+				collections: this.collections(),
+				wunphile: this,
+			})
+		} else if (Array.isArray(source)) {
+			raw = source
+		} else {
+			for (const provider of this.#staticPathsProviders) {
+				raw.push(...(await provider()))
+			}
+			if (raw.length === 0) {
+				for (const entries of this.#collections.values()) {
+					raw.push(...entries)
+				}
+			}
+		}
+		return (raw ?? []).map((item) => {
+			if (typeof item === 'string') {
+				return { slug: item }
+			}
+			if (item?.params && typeof item.params === 'object') {
+				return { ...item.params, __entry: item }
+			}
+			return { ...item, __entry: item }
+		})
+	}
+	/**
+	 * Locale prefixes applied to expanded routes.
+	 * @returns {{ locale: string | null, prefix: string }[]}
+	 */
+	#localeVariants() {
+		const i18n = this.#i18nOptions
+		if (i18n == null) {
+			return [{ locale: null, prefix: '' }]
+		}
+		const locales = /** @type {string[]} */ (i18n.locales)
+		return locales.map((locale) => ({
+			locale,
+			prefix:
+				locale === i18n.defaultLocale && !i18n.prefixDefault
+					? ''
+					: `/${locale}`,
+		}))
+	}
+	/**
+	 * Expands all registered dynamic pages into concrete page mappings (#6).
+	 * @returns {Promise<void>}
+	 */
+	async #expandDynamicPages() {
+		for (const [pattern, reg] of this.#dynamicPages) {
+			const paramSets = await this.#resolveParamSets(reg.options)
+			if (paramSets.length === 0) {
+				console.warn(
+					`[wunphile] dynamic route "${pattern}" produced no paths. Register getStaticPaths() or a content collection.`,
+				)
+				continue
+			}
+			for (const params of paramSets) {
+				const filled = this.#fillPathParams(pattern, params)
+				for (const variant of this.#localeVariants()) {
+					const dest = normalizeUrlPath(variant.prefix + filled)
+					const ctx = this.#makeContext(
+						dest,
+						params,
+						variant.locale,
+						params.__entry ?? null,
+					)
+					this.#pageMapping.set(dest, () => reg.component(ctx))
+					this.#pageMeta.set(dest, {
+						...reg.options.meta,
+						cacheKey: JSON.stringify({ pattern, params, locale: variant.locale }),
+						lastmod:
+							reg.options.meta?.lastmod ??
+							(params.__entry?.mtime != null
+								? new Date(params.__entry.mtime).toISOString().slice(0, 10)
+								: undefined),
+					})
+				}
+			}
+		}
+	}
+	/**
+	 * Synchronous expansion used by the hot-reload worker.
+	 * @param {string} path
+	 * @param {any} options
+	 * @returns {{ dest: string, ctx: PageContext }[]}
+	 */
+	#expandPagePathsSync(path, options) {
+		if (!/\[[^\]]+\]/.test(path) && this.#i18nOptions == null) {
+			return [{ dest: path, ctx: this.#makeContext(path, {}, null, null) }]
+		}
+		/** @type {any[]} */
+		let raw = []
+		const isDynamic = /\[[^\]]+\]/.test(path)
+		if (Array.isArray(options.paths)) {
+			raw = options.paths
+		} else if (typeof options.paths === 'string') {
+			raw = this.#collections.get(options.paths) ?? []
+		} else if (isDynamic) {
+			for (const provider of this.#staticPathsProviders) {
+				const result = provider()
+				if (Array.isArray(result)) {
+					raw.push(...result)
+				}
+			}
+			if (raw.length === 0) {
+				for (const entries of this.#collections.values()) {
+					raw.push(...entries)
+				}
+			}
+		} else {
+			// Non-dynamic pages still need one expansion per locale.
+			raw = [{}]
+		}
+		const paramSets = raw.map((item) =>
+			typeof item === 'string' ? { slug: item } : { ...item, __entry: item },
+		)
+		/** @type {{ dest: string, ctx: PageContext }[]} */
+		const out = []
+		for (const params of paramSets) {
+			const filled = this.#fillPathParams(path, params)
+			for (const variant of this.#localeVariants()) {
+				const dest = normalizeUrlPath(variant.prefix + filled)
+				out.push({
+					dest,
+					ctx: this.#makeContext(dest, params, variant.locale, params.__entry ?? null),
+				})
+			}
+		}
+		return out.length > 0
+			? out
+			: [{ dest: path, ctx: this.#makeContext(path, {}, null, null) }]
+	}
+	/* ==================================================================
+	 * Rendering (#7, #18, #20, #21, #30, #36)
+	 * ================================================================ */
+	/**
+	 * Renders one page component into its final string.
+	 * @param {string} dest
+	 * @param {Component<any, any>} component
+	 * @param {PageContext} ctx
+	 * @returns {Promise<string>}
+	 */
+	async #renderPage(dest, component, ctx) {
+		this.#currentPagePath = dest
+		let fragments = await component(ctx)
+		if (fragments == null) {
+			fragments = []
+		}
+		if (!Array.isArray(fragments)) {
+			fragments = RenderFragment.from(fragments)
+		}
+		if (this.#layoutFn != null && isHtmlPath(dest)) {
+			fragments = this.#layoutFn(fragments, ctx) ?? fragments
+		}
+		return this.#renderToHtmlAsync(fragments, { path: dest, ctx })
+	}
+	/**
+	 * Writes one page, with a boundary check (#35).
+	 * @param {string} dest
+	 * @param {string} content
+	 * @returns {Promise<void>}
+	 */
+	async #writePage(dest, content) {
+		const outPath = this.#safeOutputPath(dest)
+		await fs.mkdir(pathUtil.dirname(outPath), { recursive: true })
+		await fs.writeFile(outPath, content)
+	}
+	/* ==================================================================
+	 * Plugins / config (#25, #26)
+	 * ================================================================ */
+	/**
+	 * Registers plugins. A plugin may implement `onPageRender(html, path)`,
+	 * `onAsset(asset)`, `onBuildEnd(manifest)` and `onDevRequest(req, res)`.
+	 * @param {...(Plugin | Plugin[] | null | undefined)} plugins
+	 * @returns {Wunphile} This
+	 */
+	use(...plugins) {
+		for (const group of plugins) {
+			if (group == null) {
+				continue
+			}
+			for (const plugin of Array.isArray(group) ? group : [group]) {
+				if (plugin) {
+					this.#plugins.push(plugin)
+				}
+			}
+		}
+		return this
+	}
+	/** Alias for {@link use}. @param {...Plugin} plugins @returns {Wunphile} */
+	plugin(...plugins) {
+		return this.use(...plugins)
+	}
+	/**
+	 * Registers a transform for an asset extension (#2).
+	 * `fn` may be sync or async and receives `(content, { path, ext })`.
+	 * It runs before optional esbuild/lightningcss transforms.
+	 * @param {string} ext Extension, with or without leading `.`
+	 * @param {(content: string, ctx: { path: string, ext: string }) => string | Buffer | Promise<string | Buffer>} fn
+	 * @returns {Wunphile} This
+	 */
+	transformAsset(ext, fn) {
+		const key = ext.replace(/^\./, '').toLowerCase()
+		if (!this.#transformHooks.has(key)) {
+			this.#transformHooks.set(key, [])
+		}
+		/** @type {any[]} */ (this.#transformHooks.get(key)).push(fn)
+		return this
+	}
+	/* ==================================================================
+	 * Content layer (#5, #6, #7)
+	 * ================================================================ */
+	/**
+	 * Sorts content entries by `field:asc|desc`.
+	 * @param {ContentEntry[]} entries
+	 * @param {string | ((a: ContentEntry, b: ContentEntry) => number) | undefined} sort
+	 * @returns {ContentEntry[]}
+	 */
+	#sortEntries(entries, sort) {
+		if (typeof sort === 'function') {
+			return [...entries].sort(sort)
+		}
+		if (!sort) {
+			return entries
+		}
+		const [field, direction] = String(sort).split(':')
+		const sign = direction === 'desc' ? -1 : 1
+		return [...entries].sort((a, b) => {
+			const av = a.data[field] ?? /** @type {any} */ (a)[field]
+			const bv = b.data[field] ?? /** @type {any} */ (b)[field]
+			const an = typeof av === 'number' ? av : Date.parse(String(av ?? ''))
+			const bn = typeof bv === 'number' ? bv : Date.parse(String(bv ?? ''))
+			if (!Number.isNaN(an) && !Number.isNaN(bn)) {
+				return (an - bn) * sign
+			}
+			return String(av ?? '').localeCompare(String(bv ?? '')) * sign
+		})
+	}
+	/**
+	 * Recursively scans a directory, parses frontmatter and renders Markdown.
+	 * `marked` / `markdown-it` are used when installed; otherwise a builtin
+	 * renderer is used. Always synchronous so collections can be iterated
+	 * directly while defining pages (#5).
+	 *
+	 * @param {string} dir Directory relative to the project root (or absolute)
+	 * @param {{ pattern?: string, name?: string, sort?: string | Function, slug?: (entry: any) => string, renderer?: string, limit?: number }} [options]
+	 * @returns {ContentEntry[]}
+	 */
+	contentDir(dir, options = {}) {
+		const dirPath = pathUtil.isAbsolute(dir)
+			? dir
+			: this.toProjectPath(dir)
+		const pattern = options.pattern ?? '**/*.md'
+		const re = globToRegExp(pattern)
+		/** @type {ContentEntry[]} */
+		const entries = []
+		/** @type {string[]} */
+		const stack = ['']
+		while (stack.length > 0) {
+			const relDir = /** @type {string} */ (stack.pop())
+			let dirents = []
+			try {
+				dirents = fsSync.readdirSync(pathUtil.join(dirPath, relDir), {
+					withFileTypes: true,
+				})
+			} catch {
+				continue
+			}
+			for (const dirent of dirents) {
+				const rel = toPosixPath(pathUtil.join(relDir, dirent.name))
+				if (dirent.isDirectory()) {
+					stack.push(rel)
+					continue
+				}
+				if (!dirent.isFile() || !re.test(rel)) {
+					continue
+				}
+				const full = pathUtil.join(dirPath, rel)
+				const raw = fsSync.readFileSync(full, 'utf8')
+				const { data, body } = parseFrontmatter(raw)
+				const stat = fsSync.statSync(full)
+				const slug =
+					typeof options.slug === 'function'
+						? options.slug({ data, path: rel })
+						: String(
+								data.slug ??
+									rel.replace(/\.[^./]+$/, '').replace(/^.*\//, ''),
+							)
+				const heading = /^#\s+(.+)$/m.exec(body)
+				const html = renderMarkdown(body, {
+					...this.#markdownOptions,
+					renderer: options.renderer ?? this.#markdownOptions.renderer,
+					rootPath: this.#rootPath,
+				})
+				/** @type {ContentEntry} */
+				const entry = {
+					slug,
+					path: rel,
+					data,
+					body,
+					html,
+					title: String(data.title ?? (heading ? heading[1].trim() : slug)),
+					description: String(data.description ?? data.summary ?? stripHtml(html).slice(0, 160)),
+					date: String(data.date ?? data.published ?? stat.mtime.toISOString()),
+					mtime: stat.mtimeMs,
+					params: { slug },
+				}
+				if (data.params && typeof data.params === 'object') {
+					for (const [key, value] of Object.entries(data.params)) {
+						entry.params[key] = String(value)
+					}
+				}
+				entries.push(entry)
+			}
+		}
+		const sorted = this.#sortEntries(entries, /** @type {any} */ (options.sort))
+		const limited = options.limit ? sorted.slice(0, options.limit) : sorted
+		if (options.name) {
+			this.#collections.set(options.name, limited)
+		}
+		return limited
+	}
+	/**
+	 * Defines (or retrieves) a named content collection (#5).
+	 *
+	 * @example
+	 * const posts = wunphile.collection('posts', { from: './content/posts', sort: 'date:desc' })
+	 * wunphile.page('/index.html', () => html`<ul>${posts.map(p => html`<li>${p.title}</li>`)}</ul>`)
+	 *
+	 * @param {string} name
+	 * @param {{ from?: string, dir?: string, pattern?: string, sort?: string | Function, slug?: Function, limit?: number }} [options]
+	 * @returns {ContentEntry[]}
+	 */
+	collection(name, options = {}) {
+		const fromConfig = this.#contentOptions.collections?.[name]
+		const opts = { ...(fromConfig ?? {}), ...options }
+		const dir = opts.from ?? opts.dir ?? `./content/${name}`
+		const entries = this.contentDir(dir, { ...opts, name })
+		if (!isMainThread && typeof parentPort?.postMessage === 'function') {
+			parentPort.postMessage({
+				type: 'collection',
+				name,
+				entries: entries.map((entry) => ({ ...entry })),
+			})
+		}
+		return entries
+	}
+	/**
+	 * Returns all registered collections keyed by name.
+	 * @returns {Record<string, ContentEntry[]>}
+	 */
+	collections() {
+		return Object.fromEntries(this.#collections)
+	}
+	/**
+	 * Registers a `getStaticPaths()` provider for dynamic routes (#6).
+	 * Providers may return an array (or a promise of one) of param objects.
+	 * @param {() => any[] | Promise<any[]>} fn
+	 * @returns {Wunphile} This
+	 */
+	getStaticPaths(fn) {
+		this.#staticPathsProviders.push(fn)
+		return this
+	}
+	/**
+	 * Sets a global layout wrapper. The function receives the page's render
+	 * fragments and the page context and returns new render fragments (#7).
+	 * `<Head>` fragments are collected from both the page and the layout and
+	 * injected into `<head>` after rendering.
+	 *
+	 * @param {(children: RenderFragments, ctx: PageContext) => RenderFragments} fn
+	 * @returns {Wunphile} This
+	 */
+	layout(fn) {
+		this.#layoutFn = fn
+		return this
+	}
+	/**
+	 * Enables i18n route expansion (#32). `page('/about', ...)` then emits
+	 * `/about` (default locale) plus `/<locale>/about`.
+	 * @param {{ locales: string[], defaultLocale?: string, prefixDefault?: boolean, urlForLocale?: (locale: string, path: string) => string }} options
+	 * @returns {Wunphile} This
+	 */
+	i18n(options) {
+		const locales = options.locales ?? ['en']
+		this.#i18nOptions = {
+			locales,
+			defaultLocale: options.defaultLocale ?? locales[0],
+			prefixDefault: Boolean(options.prefixDefault),
+			urlForLocale: options.urlForLocale,
+		}
+		return this
+	}
+	/**
+	 * Returns language-switch links for a URL path (#32).
+	 * @param {string} path
+	 * @returns {{ locale: string, href: string }[]}
+	 */
+	localeLinks(path) {
+		const i18n = this.#i18nOptions
+		if (i18n == null) {
+			return []
+		}
+		const cleanPath = normalizeUrlPath(path)
+		const locales = /** @type {string[]} */ (i18n.locales)
+		return locales.map((locale) => ({
+			locale,
+			href:
+				this.#base +
+				(locale === i18n.defaultLocale && !i18n.prefixDefault
+					? cleanPath
+					: `/${locale}${cleanPath === '/' ? '/' : cleanPath}`),
+		}))
+	}
+	/**
+	 * Builds the page context handed to every component.
+	 * @param {string} path
+	 * @param {Record<string, string>} [params]
+	 * @param {string | null} [locale]
+	 * @param {any} [entry]
+	 * @returns {PageContext}
+	 */
+	#makeContext(path, params = {}, locale = null, entry = null) {
+		return {
+			path,
+			params,
+			entry,
+			collections: this.collections(),
+			wunphile: this,
+			locale,
+			locales: this.#i18nOptions?.locales ?? [],
+			localeLinks: this.localeLinks(path),
+		}
+	}
+	/* ==================================================================
+	 * Asset pipeline (#1, #2, #3, #9, #10)
+	 * ================================================================ */
+	/**
+	 * Returns the fingerprinted URL for a registered asset (#1).
+	 * Falls back to the original URL when the asset is not hashed.
+	 * @param {string} path
+	 * @returns {string}
+	 */
+	asset(path) {
+		const clean = normalizeUrlPath(path)
+		return this.#base + (this.#assetManifest.get(clean) ?? clean)
+	}
+	/**
+	 * Returns the URL-style path prefixed with `base`.
+	 * @param {string} path
+	 * @returns {string}
+	 */
+	url(path) {
+		return this.#base + normalizeUrlPath(path)
+	}
+	/**
+	 * Returns a copy of the generated asset manifest (#1).
+	 * @returns {Record<string, string>}
+	 */
+	manifest() {
+		return Object.fromEntries(this.#assetManifest)
+	}
+	/**
+	 * Returns asset records for the current build (used by plugins).
+	 * @returns {any[]}
+	 */
+	assets() {
+		return [...this.#assets.values()]
+	}
+	/**
+	 * The absolute origin used for canonical/feed URLs.
+	 * @returns {string}
+	 */
+	#effectiveBaseUrl() {
+		return this.#baseUrl ?? this.#sitemapBaseUrl ?? ''
+	}
+	/**
+	 * Returns a stable CSP nonce for injected scripts (#36).
+	 * Enable with `defineConfig({ csp: true })` or `enableCsp()`.
+	 * @returns {string}
+	 */
+	cspNonce() {
+		if (this.#currentNonce === '') {
+			this.#currentNonce = randomUUID()
+		}
+		return this.#currentNonce
+	}
+	/**
+	 * Enables CSP nonce generation (#36).
+	 * @param {boolean} [enabled=true]
+	 * @returns {Wunphile} This
+	 */
+	enableCsp(enabled = true) {
+		this.#cspEnabled = enabled
+		return this
+	}
+	/**
+	 * Routes all shared behavior-module dependencies through one canonical
+	 * absolute `/_wfclient/...` URL (#19).
+	 * @param {boolean} [enabled=true]
+	 * @returns {Wunphile} This
+	 */
+	absoluteImports(enabled = true) {
+		this.#absoluteImports = enabled
+		this.#clientManager.setAbsoluteImports(enabled)
+		return this
+	}
+	/** @returns {string} The `<script>` nonce attribute, or an empty string. */
+	#nonceAttr() {
+		return this.#cspEnabled
+			? ` nonce="${escapeAttribute(this.cspNonce())}"`
+			: ''
+	}
+	/**
+	 * Internal hook used by ClientManager to record module dependencies (#23).
+	 * @param {string} path
+	 */
+	noteModuleDependency(path) {
+		const current = this.#currentPagePath
+		if (current == null) {
+			return
+		}
+		if (!this.#pageDeps.has(current)) {
+			this.#pageDeps.set(current, new Set())
+		}
+		/** @type {Set<string>} */ (this.#pageDeps.get(current)).add(path)
+	}
+	/**
+	 * Resolves a source file for the image pipeline.
+	 * @param {string} src
+	 * @returns {string}
+	 */
+	#resolveImageSource(src) {
+		if (src.startsWith('/')) {
+			for (const [mount, dir] of this.#staticDirMappings) {
+				const prefix = mount.replace(/\/+$/, '')
+				if (src === prefix || src.startsWith(prefix + '/')) {
+					return pathUtil.join(
+						this.toProjectPath(dir),
+						src.slice(prefix.length).replace(/^\/+/, ''),
+					)
+				}
+			}
+			return this.toProjectPath(src)
+		}
+		return pathUtil.resolve(this.#rootPath, src)
+	}
+	/**
+	 * Generates a `<picture>`/`<img>` fragment with responsive variants,
+	 * content-hashed filenames and width/height to avoid CLS (#9).
+	 *
+	 * Uses `sharp` when installed; otherwise it fingerprints the original
+	 * file and infers dimensions from its header. Returns `RenderFragments`.
+	 *
+	 * @param {string} src
+	 * @param {{ widths?: number[], formats?: string[], alt?: string, sizes?: string, loading?: string, quality?: number, hash?: boolean }} [options]
+	 * @returns {RenderFragments}
+	 */
+	image(src, options = {}) {
+		const opts = { ...(this.#imageOptions ?? {}), ...options }
+		const widths = opts.widths ?? [400, 800, 1600]
+		const formats = opts.formats ?? ['avif', 'webp']
+		const sourcePath = this.#resolveImageSource(src)
+		let buffer
+		try {
+			buffer = fsSync.readFileSync(sourcePath)
+		} catch (err) {
+			throw new Error(
+				`Unable to read image "${src}" (resolved to "${sourcePath}"): ${err}`,
+			)
+		}
+		const sourceHash = contentHash(buffer)
+		const dims = readImageSize(buffer) ?? { width: 0, height: 0 }
+		const ext = pathUtil.extname(src).slice(1).toLowerCase()
+		const baseName = src.replace(/^\/+/, '')
+		const sharp = resolveOptional('sharp', this.#rootPath)
+		const alt = escapeAttribute(opts.alt ?? '')
+		const sizes = opts.sizes ? ` sizes="${escapeAttribute(opts.sizes)}"` : ''
+		const dimAttr =
+			dims.width && dims.height
+				? ` width="${dims.width}" height="${dims.height}"`
+				: ''
+		const loading = ` loading="${escapeAttribute(opts.loading ?? 'lazy')}" decoding="async"`
+		if (!sharp) {
+			const outUrl = hashPath(baseName, sourceHash)
+			this.#imageVariants.push({
+				type: 'original',
+				outUrl,
+				sourcePath,
+				mime: mimeForExt(ext),
+			})
+			return html(
+				`<img src="${escapeAttribute('/' + outUrl)}"${dimAttr} alt="${alt}"${loading} />`,
+			)
+		}
+		/** @type {{ format: string, candidates: { url: string, width: number }[] }[]} */
+		const groups = []
+		for (const format of formats) {
+			/** @type {{ url: string, width: number }[]} */
+			const candidates = []
+			for (const width of widths) {
+				const variantHash = contentHash(
+					`${sourceHash}|${width}|${format}|${opts.quality ?? ''}`,
+				)
+				const outUrl = hashPath(
+					`${baseName.replace(/\.[^./]+$/, '')}.${width}w.${format}`,
+					variantHash,
+				) + `.${format}`
+				this.#imageVariants.push({
+					type: 'variant',
+					outUrl,
+					sourcePath,
+					width,
+					format,
+					quality: opts.quality,
+					mime: mimeForExt(format),
+				})
+				candidates.push({ url: '/' + outUrl, width })
+			}
+			groups.push({ format, candidates })
+		}
+		const sources = groups
+			.map(
+				(group) =>
+					`<source type="${escapeAttribute(mimeForExt(group.format))}" srcset="${escapeAttribute(group.candidates.map((c) => `${c.url} ${c.width}w`).join(', '))}"${sizes} />`,
+			)
+			.join('\n')
+		const fallback = groups[groups.length - 1]?.candidates[0]?.url ?? '/' + hashPath(baseName, sourceHash)
+		const lastGroup = groups[groups.length - 1]
+		const srcset = lastGroup
+			? escapeAttribute(
+					lastGroup.candidates.map((c) => `${c.url} ${c.width}w`).join(', '),
+				)
+			: ''
+		return html(
+			`<picture>\n${sources}\n<img src="${escapeAttribute(fallback)}"${srcset ? ` srcset="${srcset}"` : ''}${sizes}${dimAttr} alt="${alt}"${loading} />\n</picture>`,
+		)
+	}
+	/**
+	 * Enables automatic OG image generation (#10).
+	 * Uses `@resvg/resvg-js` for PNG output when available; otherwise a pure
+	 * SVG card (no native dependency) is written and linked.
+	 * @param {{ template?: string | ((ctx: { title: string, path: string }) => string), width?: number, height?: number, background?: string, color?: string, prefix?: string }} [options]
+	 * @returns {Wunphile} This
+	 */
+	ogImage(options = {}) {
+		const resvg = resolveOptional('@resvg/resvg-js', this.#rootPath)
+		this.#ogImageOptions = {
+			width: 1200,
+			height: 630,
+			background: '#0f172a',
+			color: '#f8fafc',
+			prefix: '/og',
+			...options,
+			resvg: resvg ?? null,
+			format: resvg ? 'png' : 'svg',
+		}
+		return this
+	}
+	/**
+	 * Generates the OG image SVG for a page title.
+	 * @param {string} title
+	 * @param {any} opts
+	 * @returns {string}
+	 */
+	#ogSvg(title, opts) {
+		if (typeof opts.template === 'function') {
+			return opts.template({ title, path: this.#currentPagePath ?? '' })
+		}
+		const escaped = sanitizeHtml(stripHtml(title).slice(0, 120))
+		const lines = escaped.length > 42
+			? [
+					escaped.slice(0, 42),
+					escaped.slice(42, 84),
+				]
+			: [escaped]
+		if (typeof opts.template === 'string') {
+			return opts.template.replaceAll('{title}', escaped)
+		}
+		const text = lines
+			.map(
+				(line, i) =>
+					`<text x="72" y="${260 + i * 84}" font-family="sans-serif" font-size="64" font-weight="700" fill="${escapeAttribute(opts.color)}">${line}</text>`,
+			)
+			.join('\n')
+		return `<svg xmlns="http://www.w3.org/2000/svg" width="${opts.width}" height="${opts.height}" viewBox="0 0 ${opts.width} ${opts.height}"><rect width="100%" height="100%" fill="${escapeAttribute(opts.background)}"/>${text}<text x="72" y="${opts.height - 72}" font-family="sans-serif" font-size="28" fill="${escapeAttribute(opts.color)}" opacity="0.65">${escapeAttribute(this.#effectiveBaseUrl())}</text></svg>`
+	}
+	/**
+	 * Registers (and returns) the OG image URL for a page.
+	 * @param {string} path
+	 * @param {Record<string, any>} head
+	 * @returns {string | null}
+	 */
+	#computeOgImage(path, head) {
+		const opts = this.#ogImageOptions
+		if (opts == null) {
+			return null
+		}
+		const slug =
+			path
+				.replace(/^\/+/, '')
+				.replace(/\.[^./]+$/, '')
+				.replace(/[^a-zA-Z0-9_-]+/g, '-')
+				.replace(/^-+|-+$/g, '') || 'index'
+		const ext = opts.format
+		const url = `${opts.prefix}/${slug}.${ext}`
+		const svg = this.#ogSvg(String(head.title ?? head.og?.title ?? slug), opts)
+		if (ext === 'png' && opts.resvg) {
+			try {
+				const Resvg = opts.resvg.Resvg ?? opts.resvg
+				const png = new Resvg(svg, { fitTo: { mode: 'width', value: opts.width } })
+					.render()
+					.asPng()
+				this.#ogImages.set(url, Buffer.from(png))
+			} catch {
+				// Fall back to pure SVG if resvg fails at runtime.
+				this.#ogImageOptions = { ...opts, format: 'svg', resvg: null }
+				return this.#computeOgImage(path, head)
+			}
+		} else {
+			this.#ogImages.set(url, Buffer.from(svg, 'utf8'))
+		}
+		this.#generatedPaths.add(url)
+		return this.#effectiveBaseUrl() + this.url(url)
+	}
+	/* ==================================================================
+	 * Feeds, robots, adapters (#8, #11)
+	 * ================================================================ */
+	/**
+	 * Registers an RSS, Atom or JSON Feed generator (#8).
+	 * @param {{ collection?: string, path?: string, format?: 'rss' | 'atom' | 'json', baseUrl?: string, title?: string, description?: string, language?: string, author?: string, entries?: any[], url?: Function, limit?: number }} options
+	 * @returns {Wunphile} This
+	 */
+	feed(options = {}) {
+		/** @type {any} */
+		const opts = {
+			collection: 'posts',
+			path: '/feed.xml',
+			format: 'rss',
+			...options,
+		}
+		this.#feeds.push(opts)
+		this.#generatedPaths.add(opts.path)
+		this.page(opts.path, () =>
+			html(
+				buildFeed({
+					...opts,
+					baseUrl: opts.baseUrl ?? this.#effectiveBaseUrl(),
+					entries: this.#feedEntries(opts),
+				}),
+			),
+		)
+		return this
+	}
+	/**
+	 * Resolves the entries for a feed.
+	 * @param {any} opts
+	 * @returns {any[]}
+	 */
+	#feedEntries(opts) {
+		const entries =
+			opts.entries ?? this.#collections.get(opts.collection ?? 'posts') ?? []
+		return opts.limit ? entries.slice(0, opts.limit) : entries
+	}
+	/**
+	 * Registers a `robots.txt` generator (#8).
+	 * @param {{ sitemap?: boolean | string, disallow?: string[], allow?: string[], userAgent?: string, host?: string, extra?: string[], path?: string }} [options]
+	 * @returns {Wunphile} This
+	 */
+	robotsTxt(options = {}) {
+		const opts = { sitemap: true, disallow: [], ...options }
+		const path = opts.path ?? '/robots.txt'
+		this.#robotsOptions = opts
+		this.#generatedPaths.add(path)
+		this.page(path, () =>
+			html(
+				buildRobots({
+					...opts,
+					sitemap:
+						opts.sitemap === true
+							? this.#effectiveBaseUrl() + this.url(this.#sitemapPath ?? '/sitemap.xml')
+							: opts.sitemap,
+					host: opts.host ?? this.#effectiveBaseUrl(),
+				}),
+			),
+		)
+		return this
+	}
+	/**
+	 * Selects a deployment adapter (#11). At build time Wunphile emits
+	 * `_redirects`/`_headers`, `vercel.json`, `_routes.json` or `.nojekyll`.
+	 * @param {'netlify' | 'vercel' | 'cloudflare-pages' | 'github-pages' | { name: string, [key: string]: any }} name
+	 * @returns {Wunphile} This
+	 */
+	adapter(name) {
+		this.#adapter =
+			typeof name === 'string' ? { name } : { ...name }
+		return this
+	}
+	/**
+	 * Returns the last build statistics object (#38).
+	 * @returns {any | null}
+	 */
+	stats() {
+		return this.#lastStats
 	}
 	/**
 	 * Enables or disables HTML minification for the build output.
@@ -856,18 +3714,47 @@ export class Wunphile {
 	}
 	/**
 	 * Renders the provided render fragments to HTML.
-	 * Loads all behavior modules and injects loaders.
+	 *
+	 * Collects `<Head>` fragments (#7), loads behavior modules, injects the
+	 * loader with modulepreload links (#18), handles island load strategies
+	 * and per-module styles (#20/#21), then injects canonical/hreflang/OG
+	 * tags (#30/#10) and finally runs `onPageRender` plugin hooks (#25).
+	 *
 	 * @param {RenderFragments} fragments The render fragments to render
+	 * @param {{ path?: string, ctx?: PageContext }} [info] Page information
 	 * @returns {Promise<string>} The rendered HTML
 	 */
-	async #renderToHtmlAsync(fragments) {
+	async #renderToHtmlAsync(fragments, info = {}) {
+		const path = info.path ?? this.#currentPagePath ?? ''
+		const ctx =
+			info.ctx ?? this.#makeContext(path, {}, null, null)
+		// Collect HEAD fragments from the page and (optionally) the layout.
+		/** @type {Record<string, any>} */
+		const head = {}
+		/** @type {RenderFragments} */
+		const bodyFragments = []
+		for (const fragment of fragments) {
+			if (fragment.type === RenderFragmentType.HEAD) {
+				let props = fragment.meta
+				if (props == null) {
+					try {
+						props = JSON.parse(fragment.value || '{}')
+					} catch {
+						props = {}
+					}
+				}
+				Object.assign(head, props)
+			} else {
+				bodyFragments.push(fragment)
+			}
+		}
 		/**
 		 * Mapping of fragment indexes to their behavior module promises.
 		 * @type {Map<number, Promise<{ default: BehaviorModule }>>}
 		 */
 		const fragProms = new Map()
-		for (let i = 0; i < fragments.length; i++) {
-			const fragment = fragments[i]
+		for (let i = 0; i < bodyFragments.length; i++) {
+			const fragment = bodyFragments[i]
 			if (fragment.type === RenderFragmentType.BEHAVIOR_MODULE) {
 				const prom =
 					/** @type {Promise<{ default: BehaviorModule }>} */ (
@@ -879,11 +3766,7 @@ export class Wunphile {
 		}
 		// Wait for all behavior modules to load before we start injecting loaders.
 		await this.#clientManager.waitForModules()
-		/**
-		 * Mapping of fragment indexes to their loaded behavior modules.
-		 * Values are behavior modules' rewritten paths, relative to the client root (POSIX-style).
-		 * @type {Map<number, string>}
-		 */
+		/** @type {Map<number, LoaderDescriptor>} */
 		const fragMods = new Map()
 		for (const [i, prom] of fragProms.entries()) {
 			const mod = /** @type {BehaviorModule} */ ((await prom).default)
@@ -893,37 +3776,83 @@ export class Wunphile {
 				this.#clientManager.rootPath,
 				fileURLToPath(mod.behaviorModuleUrl),
 			)
-			const info = this.#clientManager.loadedModules.get(relativePath)
-			if (info?.type !== 'behavior') {
+			const loaded = this.#clientManager.loadedModules.get(relativePath)
+			if (loaded?.type !== 'behavior') {
 				throw new Error(
 					`Supposed behavior module "${relativePath}" is not a behavior module.`,
 				)
 			}
-			fragMods.set(i, info.rewrittenPath)
+			/** @type {any} */
+			const fragmentMeta = bodyFragments[i].meta ?? {}
+			/** @type {LoaderDescriptor} */
+			const desc = {
+				p: loaded.rewrittenPath,
+				l:
+					/** @type {LoadStrategy} */ (
+						fragmentMeta.load ?? loaded.load ?? 'eager'
+					),
+				s: loaded.styles,
+			}
+			fragMods.set(i, desc)
+			// #23: track the page's module dependencies for incremental builds.
+			this.#currentPagePath = path
+			this.noteModuleDependency(loaded.rewrittenPath)
 		}
 		/** @type {string[]} */
 		const res = []
-		for (let i = 0; i < fragments.length; i++) {
-			const fragment = fragments[i]
+		for (let i = 0; i < bodyFragments.length; i++) {
+			const fragment = bodyFragments[i]
 			if (fragment.type === RenderFragmentType.BEHAVIOR_MODULE) {
-				const relativePath = /** @type {string} */ (fragMods.get(i))
-				// We add a hydration comment that will be used by the loader to find components to apply behaviors to.
-				res.push(
-					`<!--${CLIENT_BEHAVIOR_HYDRATE_PREFIX}${relativePath}-->`,
-				)
+				const desc = /** @type {LoaderDescriptor} */ (fragMods.get(i))
+				res.push(`<!--${behaviorComment(desc)}-->`)
 			} else if (
 				fragment.type === RenderFragmentType.BEHAVIOR_MODULE_LOADER
 			) {
 				if (fragMods.size !== 0) {
+					const descs = [...fragMods.values()]
 					res.push(
-						`<script type="module">\n${this.#clientManager.generateLoaderScript([...fragMods.values()])}\n</script>`,
+						modulePreloadLinks(descs, this.url('/_wfclient/').replace(/\/$/, '') + '/'),
+					)
+					res.push(
+						`<script type="module"${this.#nonceAttr()}>\n${generateLoaderScript(descs, {
+							strategy: this.#loaderStrategy,
+							base: this.url('/_wfclient/').replace(/\/$/, '') + '/',
+						})}\n</script>`,
 					)
 				}
 			} else {
 				res.push(fragment.toHtml())
 			}
 		}
-		return res.join('')
+		let content = res.join('')
+		if (isHtmlPath(path)) {
+			const ogImage = this.#computeOgImage(path, head)
+			const siteBase = this.#effectiveBaseUrl() + this.#base
+			const i18n = this.#i18nOptions
+			const headTags = renderHeadTags(head, {
+				baseUrl: siteBase,
+				path,
+				locales: i18n?.locales ?? [],
+				defaultLocale: i18n?.defaultLocale,
+				locale: ctx.locale,
+				ogImage,
+				urlForLocale: i18n?.urlForLocale
+					? (locale, p) =>
+							siteBase +
+							i18n.urlForLocale(locale, p)
+					: undefined,
+			})
+			content = injectHead(content, headTags)
+		}
+		for (const plugin of this.#plugins) {
+			if (typeof plugin.onPageRender === 'function') {
+				const result = await plugin.onPageRender(content, path)
+				if (typeof result === 'string') {
+					content = result
+				}
+			}
+		}
+		return content
 	}
 	/**
 	 * Loads a mapping of lowercase file extensions (without the leading `.`) to their file extension.
@@ -1080,61 +4009,112 @@ export class Wunphile {
 	}
 	/**
 	 * Registers a component to a page path.
+	 *
+	 * Paths containing `[param]` / `[...rest]` are dynamic (#6): they are
+	 * expanded at build time from `getStaticPaths()` or content collections.
+	 * With i18n enabled, every page is also registered for each locale (#32).
+	 *
 	 * @param {string} path The page's path
-	 * @param {Component<void, void>} component The page's component
+	 * @param {Component<any, any>} component The page's component
+	 * @param {{ paths?: any, getStaticPaths?: Function, meta?: SitemapEntry, dynamic?: boolean }} [options]
 	 */
-	page(path, component) {
+	page(path, component, options = {}) {
 		if (!path.startsWith('/')) {
 			throw new Error(
 				`Page path must start with a forward slash, but got "${path}"`,
 			)
 		}
+		const clean = toPosixPath(path)
+		if (options.meta != null) {
+			this.#pageMeta.set(clean, options.meta)
+		}
+		const isDynamic =
+			options.dynamic === true || /\[[^\]]+\]/.test(clean)
 		if (isMainThread) {
-			this.#pageMapping.set(path, component)
+			if (isDynamic) {
+				this.#dynamicPages.set(clean, { component, options })
+				return
+			}
+			for (const variant of this.#localeVariants()) {
+				const dest = normalizeUrlPath(variant.prefix + clean)
+				const ctx = this.#makeContext(dest, {}, variant.locale, null)
+				this.#pageMapping.set(
+					dest,
+					variant.locale == null
+						? component
+						: () => component(ctx),
+				)
+				if (variant.locale != null) {
+					this.#pageMeta.set(dest, {
+						...this.#pageMeta.get(clean),
+						cacheKey: JSON.stringify({ path: clean, locale: variant.locale }),
+					})
+				}
+			}
 		} else {
-			// FIX #12: Without a rejection handler, a failed render became an
-			// unhandled rejection inside the worker and the main thread kept
-			// treating the reload as successful. Report it as pageError.
-			this.#renderToHtmlAsync(component())
-				.then((content) => {
-					parentPort.postMessage({
-						type: 'pageRaw',
-						path,
-						content,
+			// FIX #12: a failed render must be reported to the main thread,
+			// otherwise the reload is incorrectly treated as successful.
+			for (const { dest, ctx } of this.#expandPagePathsSync(clean, options)) {
+				this.#renderPage(dest, component, ctx)
+					.then((content) => {
+						parentPort.postMessage({
+							type: 'pageRaw',
+							path: dest,
+							content,
+						})
 					})
-				})
-				.catch((err) => {
-					parentPort.postMessage({
-						type: 'pageError',
-						path,
-						error:
-							err instanceof Error
-								? err.stack || err.message
-								: String(err),
+					.catch((err) => {
+						parentPort.postMessage({
+							type: 'pageError',
+							path: dest,
+							error:
+								err instanceof Error
+									? err.stack || err.message
+									: String(err),
+						})
 					})
-				})
+			}
 		}
 	}
 	/**
 	 * Registers raw content to a page path.
 	 * @param {string} path The page's path
 	 * @param {string} content The page's content
+	 * @param {any} [options]
 	 */
-	pageRaw(path, content) {
-		this.page(path, () => html(content))
+	pageRaw(path, content, options) {
+		this.page(path, () => html(content), options)
 	}
 	/**
-	 * Registers a redirect from one path to another.
+	 * Registers a redirect from one path to another (#12/#34).
+	 *
+	 * The target is validated: only `/`-relative paths and http(s) URLs are
+	 * accepted, so `javascript:` payloads can never reach `href` or
+	 * `location.assign()`. With an adapter configured, `status` is emitted
+	 * as a real 301/302 in `_redirects` / `vercel.json`; the dev server
+	 * responds with the same status directly. An HTML fallback page is still
+	 * generated for plain static hosts.
+	 *
 	 * @param {string} path The path to redirect from
 	 * @param {string} url The URL/path to redirect to
+	 * @param {{ status?: 301 | 302 | 303 | 307 | 308 }} [options]
 	 */
-	redirect(path, url) {
+	redirect(path, url, options = {}) {
+		const target = safeRedirectUrl(url)
+		const status = options.status ?? 301
+		if (![301, 302, 303, 307, 308].includes(status)) {
+			throw new Error(`Invalid redirect status: ${status}`)
+		}
 		// FIX #8: Remember redirect paths so #buildSitemap() can omit them.
 		this.#redirectPaths.add(path)
-		// FIX #3: Build a single HTML fragment holding the JSON string literal.
-		// JSON.stringify() output is already a valid, escaped JS literal, so
-		// the generated <script> body parses as JavaScript; interpolating an
-		// array of RenderFragments here is never safe.
+		if (isMainThread) {
+			this.#redirects.set(path, { to: target, status })
+		} else if (typeof parentPort?.postMessage === 'function') {
+			parentPort.postMessage({ type: 'redirect', path, to: target, status })
+		}
+		// FIX #3: JSON.stringify() output is already a valid JS literal.
+		// jsStringLiteral() additionally prevents `</script>` from escaping
+		// the inline script element (#34).
 		// prettier-ignore
 		this.page(path, () => html`
 <!doctype html>
@@ -1145,12 +4125,12 @@ export class Wunphile {
             name="viewport"
             content="width=device-width, initial-scale=1"
         />
-        <title>Redirecting to ${url}...</title>
+        <title>Redirecting to ${target}...</title>
     </head>
     <body>
-        Redirecting to <a href="${url}">${url}</a>... (click link if nothing happens)
-        <meta http-equiv="refresh" content="0; url=${url}" />
-        <script>location.assign(${new RenderFragment(RenderFragmentType.HTML, JSON.stringify(url))})</script>
+        Redirecting to <a href="${target}">${target}</a>... (click link if nothing happens)
+        <meta http-equiv="refresh" content="0; url=${target}" />
+        <script${new RenderFragment(RenderFragmentType.HTML, this.#nonceAttr())}>location.assign(${new RenderFragment(RenderFragmentType.HTML, jsStringLiteral(target))})</script>
     </body>
 </html>
         `)
@@ -1166,8 +4146,9 @@ export class Wunphile {
 	 * Registers a static directory to a path.
 	 * @param {string} path The path to the static directory
 	 * @param {string} dir The directory to copy
+	 * @param {StaticOptions} [options] `{ hash: true }` fingerprints every file (#1)
 	 */
-	staticDir(path, dir) {
+	staticDir(path, dir, options = {}) {
 		if (!path.startsWith('/')) {
 			throw new Error(
 				`Static directory path must start with a forward slash, but got "${path}"`,
@@ -1175,11 +4156,13 @@ export class Wunphile {
 		}
 		if (isMainThread) {
 			this.#staticDirMappings.set(toPosixPath(path), dir)
+			this.#staticDirOptions.set(toPosixPath(path), options)
 		} else {
 			parentPort.postMessage({
 				type: 'staticDir',
 				path,
 				dir,
+				options,
 			})
 		}
 	}
@@ -1187,8 +4170,9 @@ export class Wunphile {
 	 * Registers a static file to a path.
 	 * @param {string} path The path to the static file
 	 * @param {string} file The file to copy
+	 * @param {StaticOptions} [options] `{ hash: true }` fingerprints the file (#1)
 	 */
-	staticFile(path, file) {
+	staticFile(path, file, options = {}) {
 		if (!path.startsWith('/')) {
 			throw new Error(
 				`Static file path must start with a forward slash, but got "${path}"`,
@@ -1196,11 +4180,13 @@ export class Wunphile {
 		}
 		if (isMainThread) {
 			this.#staticFileMappings.set(toPosixPath(path), file)
+			this.#staticFileOptions.set(toPosixPath(path), options)
 		} else {
 			parentPort.postMessage({
 				type: 'staticFile',
 				path,
 				file,
+				options,
 			})
 		}
 	}
@@ -1235,575 +4221,1471 @@ export class Wunphile {
 	 * @returns {string} The minified HTML
 	 */
 	#minifyHtmlString(htmlStr) {
-		// Protect <pre>, <textarea>, <script>, <style> from whitespace collapsing.
-		const protectedRe =
-			/(<(pre|textarea|script|style)\b[^>]*>[\s\S]*?<\/\2>)/gi
-		const placeholders = []
-		const masked = htmlStr.replace(protectedRe, (match) => {
-			placeholders.push(match)
-			return `\u0000${placeholders.length - 1}\u0000`
-		})
-		let out = masked
-			// Remove HTML comments, but preserve conditional comments (<!--[if ...]> ... <![endif]-->).
-			// FIX #4: Also preserve <!--wf-behavior:...--> hydration markers,
-			// otherwise minifyHtml() silently disables every client behavior.
-			.replace(/<!--(?!\[if|wf-behavior:)[\s\S]*?-->/g, '')
-			// Collapse whitespace between tags.
-			// FIX #13: No global /\s{2,}/ -> ' ' pass; it collapsed repeated
-			// spaces inside ordinary text nodes and broke space-sensitive
-			// inline content, contrary to "conservative minify".
-			.replace(/>\s+</g, '><')
-			.trim()
-		// Restore protected blocks.
-		out = out.replace(/\u0000(\d+)\u0000/g, (_, idx) =>
-			placeholders[Number(idx)],
-		)
-		return out
+		return minifyHtml(htmlStr)
 	}
 	/**
-	 * Builds the sitemap.xml content from registered pages.
-	 * Excludes the client mount prefix, redirects, and the not-found page.
-	 *
-	 * NEW FEATURE.
-	 *
-	 * @returns {string} The sitemap.xml content
+	 * Builds the sitemap entries for registered pages (#31).
+	 * Excludes client mounts, redirects, generated feeds/robots and 404.
+	 * @returns {SitemapEntry[]}
+	 */
+	#sitemapEntries() {
+		if (this.#sitemapBaseUrl == null) {
+			return []
+		}
+		const base = this.#effectiveBaseUrl() + this.#base
+		const excludePaths = new Set([
+			this.#notFoundPath,
+			...this.#redirectPaths,
+			...this.#generatedPaths,
+		])
+		// i18n generates localized variants of 404 and redirect pages too.
+		for (const variant of this.#localeVariants()) {
+			if (variant.prefix === '') {
+				continue
+			}
+			excludePaths.add(variant.prefix + this.#notFoundPath)
+			for (const path of this.#redirectPaths) {
+				excludePaths.add(variant.prefix + path)
+			}
+		}
+		/** @type {SitemapEntry[]} */
+		const entries = []
+		for (const path of this.#pageMapping.keys()) {
+			if (path.startsWith(CLIENT_MOUNT_PREFIX) || excludePaths.has(path)) {
+				continue
+			}
+			if (!isHtmlPath(path)) {
+				continue
+			}
+			const meta = this.#pageMeta.get(path) ?? {}
+			/** @type {SitemapEntry} */
+			const entry = {
+				path,
+				lastmod: meta.lastmod,
+				changefreq: meta.changefreq,
+				priority: meta.priority,
+			}
+			const i18n = this.#i18nOptions
+			if ((i18n?.locales?.length ?? 0) > 1) {
+				const locales = /** @type {string[]} */ (i18n.locales)
+				entry.alternates = locales.map((locale) => ({
+					hreflang: locale,
+					href:
+						base +
+						(locale === i18n.defaultLocale && !i18n.prefixDefault
+							? path
+							: `/${locale}${path}`),
+				}))
+			}
+			entries.push(entry)
+		}
+		entries.sort((a, b) => String(a.path).localeCompare(String(b.path)))
+		return entries
+	}
+	/**
+	 * Builds sitemap.xml content via the pure {@link buildSitemap} export (#39).
+	 * @returns {string}
 	 */
 	#buildSitemap() {
 		if (this.#sitemapBaseUrl == null) {
 			return ''
 		}
-		const excludedPrefixes = [CLIENT_MOUNT_PREFIX]
-		// FIX #8: redirect() pages are registered through page(), so they
-		// must be filtered out explicitly along with the not-found page.
-		const excludePaths = new Set([
-			this.#notFoundPath,
-			...this.#redirectPaths,
-		])
-		const entries = []
-		for (const path of this.#pageMapping.keys()) {
-			if (excludedPrefixes.some((p) => path.startsWith(p))) {
-				continue
-			}
-			if (excludePaths.has(path)) {
-				continue
-			}
-			entries.push(this.#sitemapBaseUrl + path)
+		return buildSitemap(
+			this.#sitemapEntries(),
+			this.#effectiveBaseUrl() + this.#base,
+		)
+	}
+	/** @returns {Promise<void>} Clears the output directory. */
+	async #clearOutput() {
+		if ((await statOrNull(this.#outputPath)) === null) {
+			await fs.mkdir(this.#outputPath, { recursive: true })
+			return
 		}
-		entries.sort()
-		const xmlEntries = entries
+		/** @type {Promise<void>[]} */
+		const proms = []
+		for (const file of await fs.readdir(this.#outputPath)) {
+			proms.push(
+				fs.rm(this.toOutputPath(file), {
+					recursive: true,
+					force: true,
+				}),
+			)
+		}
+		await Promise.all(proms)
+	}
+	/** @returns {string} Path of the persistent incremental cache (#23). */
+	#buildCachePath() {
+		return pathUtil.join(this.#rootPath, CACHE_DIR, 'cache.json')
+	}
+	/** @returns {Promise<any>} */
+	async #loadBuildCache() {
+		try {
+			return JSON.parse(await fs.readFile(this.#buildCachePath(), 'utf8'))
+		} catch {
+			return { version: 1, pages: {}, assets: {} }
+		}
+	}
+	/**
+	 * @param {Record<string, string>} pages
+	 * @returns {Promise<void>}
+	 */
+	async #saveBuildCache(pages) {
+		const file = this.#buildCachePath()
+		await fs.mkdir(pathUtil.dirname(file), { recursive: true })
+		await fs.writeFile(
+			file,
+			JSON.stringify(
+				{ version: 1, pages, assets: this.manifest() },
+				null,
+				2,
+			) + '\n',
+		)
+	}
+	/**
+	 * Hash of a page's component source + dependencies (#23).
+	 * @param {string} dest
+	 * @param {any} component
+	 * @returns {string}
+	 */
+	#pageHash(dest, component) {
+		return sha256(
+			[
+				String(component?.toString?.() ?? ''),
+				String(this.#pageMeta.get(dest)?.cacheKey ?? ''),
+				JSON.stringify([...(this.#pageDeps.get(dest) ?? [])]),
+				this.#clientManager.moduleFingerprints().join('|'),
+				JSON.stringify(this.manifest()),
+				JSON.stringify({
+					minify: this.#minifyHtml,
+					base: this.#base,
+					loader: this.#loaderStrategy,
+					csp: this.#cspEnabled,
+				}),
+			].join('\n'),
+		)
+	}
+	/**
+	 * Writes generated non-page files: manifest, OG images, sitemap(s),
+	 * adapter configs and build stats.
+	 * @param {BuildOptions} opts
+	 * @param {any} stats
+	 * @returns {Promise<void>}
+	 */
+	async #writeGeneratedFiles(opts, stats) {
+		// #1: asset manifest.json
+		const manifest = this.manifest()
+		await this.#writePage('/manifest.json', JSON.stringify(manifest, null, 2) + '\n')
+		this.#generatedPaths.add('/manifest.json')
+		// #10: OG images
+		for (const [url, body] of this.#ogImages) {
+			await this.#writePageBuffer(url, body)
+		}
+		// #31: sitemap, split into parts above 50,000 URLs
+		if (this.#sitemapBaseUrl != null && this.#sitemapPath != null) {
+			const entries = this.#sitemapEntries()
+			const base = this.#effectiveBaseUrl() + this.#base
+			const sitemapPath = /** @type {string} */ (this.#sitemapPath)
+			if (entries.length > 50_000) {
+				/** @type {string[]} */
+				const parts = []
+				for (let i = 0; i < entries.length; i += 50_000) {
+					const partPath = `/sitemap-${parts.length + 1}.xml`
+					await this.#writePage(
+						partPath,
+						buildSitemap(entries.slice(i, i + 50_000), base),
+					)
+					this.#generatedPaths.add(partPath)
+					parts.push(base + this.url(partPath))
+				}
+				await this.#writePage(sitemapPath, buildSitemapIndex(parts))
+			} else {
+				await this.#writePage(sitemapPath, this.#buildSitemap())
+			}
+			this.#generatedPaths.add(sitemapPath)
+			// FIX #8: log the number of URLs actually written.
+			console.log(
+				`Generated sitemap at ${sitemapPath} with ${entries.length} URLs`,
+			)
+		}
+		// #11: deployment adapter files
+		await this.#generateAdapters()
+		// #38: build statistics
+		stats.manifest = manifest
+		stats.buildOptions = { ...opts }
+		stats.absoluteImports = this.#absoluteImports
+		stats.robots = this.#robotsOptions
+		stats.modules = this.#clientManager.moduleFingerprints()
+		let totalBytes = 0
+		for (const asset of this.#assets.values()) {
+			totalBytes += Number(asset.size ?? 0)
+		}
+		for (const page of stats.pages) {
+			totalBytes += Number(page.bytes ?? 0)
+		}
+		stats.totalBytes = totalBytes
+		let largestModule = 0
+		for (const fingerprint of stats.modules) {
+			largestModule = Math.max(largestModule, String(fingerprint).length)
+		}
+		stats.largestModule = largestModule
+		this.#lastStats = stats
+	}
+	/**
+	 * Writes a Buffer to an output path.
+	 * @param {string} url
+	 * @param {Buffer} body
+	 * @returns {Promise<void>}
+	 */
+	async #writePageBuffer(url, body) {
+		const dest = this.#safeOutputPath(url)
+		await fs.mkdir(pathUtil.dirname(dest), { recursive: true })
+		await fs.writeFile(dest, body)
+	}
+	/**
+	 * Emits platform configuration files (#11/#12).
+	 * @returns {Promise<void>}
+	 */
+	async #generateAdapters() {
+		const adapter = this.#adapter
+		if (adapter == null) {
+			return
+		}
+		const name = adapter.name
+		const redirects = [...this.#redirects.entries()].map(
+			([from, info]) => `${from}\t${info.to}\t${info.status}`,
+		)
+		const hashed = [...this.#assetManifest.values()]
+		const immutable = hashed
 			.map(
-				(url) =>
-					`  <url>\n    <loc>${sanitizeHtml(url)}</loc>\n  </url>`,
+				(path) =>
+					`${path}\n  Cache-Control: public, max-age=31536000, immutable`,
 			)
 			.join('\n')
-		return `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${xmlEntries}\n</urlset>\n`
+		const headers = `/*\n  X-Content-Type-Options: nosniff\n  Referrer-Policy: strict-origin-when-cross-origin\n${immutable ? immutable + '\n' : ''}`
+		const staticGlobs = [
+			...[...this.#staticDirMappings.keys()].map(
+				(path) => path.replace(/\/+$/, '') + '/*',
+			),
+			'/_wfclient/*',
+		]
+		if (name === 'netlify' || name === 'cloudflare-pages') {
+			await this.#writePage(
+				'/_redirects',
+				redirects.length > 0 ? redirects.join('\n') + '\n' : '',
+			)
+			await this.#writePage('/_headers', headers)
+		}
+		if (name === 'cloudflare-pages') {
+			await this.#writePage(
+				'/_routes.json',
+				JSON.stringify(
+					{ version: 1, include: ['/*'], exclude: staticGlobs },
+					null,
+					2,
+				) + '\n',
+			)
+		}
+		if (name === 'vercel') {
+			await this.#writePage(
+				'/vercel.json',
+				JSON.stringify(
+					{
+						redirects: [...this.#redirects.entries()].map(
+							([from, info]) => ({
+								source: from,
+								destination: info.to,
+								permanent: info.status === 301 || info.status === 308,
+							}),
+						),
+						headers: hashed.map((path) => ({
+							source: path,
+							headers: [
+								{
+									key: 'Cache-Control',
+									value: 'public, max-age=31536000, immutable',
+								},
+							],
+						})),
+					},
+					null,
+					2,
+				) + '\n',
+			)
+		}
+		if (name === 'github-pages') {
+			await this.#writePage('/.nojekyll', '')
+			if (adapter.cname) {
+				await this.#writePage('/CNAME', String(adapter.cname) + '\n')
+			}
+		}
+		this.#generatedPaths.add('/_redirects')
+		this.#generatedPaths.add('/_headers')
+	}
+	/**
+	 * Writes `.gz` / `.br` variants of text-like outputs (#3).
+	 * @param {('gzip' | 'br')[]} formats
+	 * @param {any} stats
+	 * @returns {Promise<void>}
+	 */
+	async #precompress(formats, stats) {
+		const extensions = new Set([
+			'.html', '.css', '.js', '.mjs', '.svg', '.json', '.xml', '.txt',
+		])
+		for (const rel of await listFilesRecursive(this.#outputPath)) {
+			if (!extensions.has(pathUtil.extname(rel).toLowerCase())) {
+				continue
+			}
+			const full = pathUtil.join(this.#outputPath, rel)
+			const buffer = await fs.readFile(full)
+			/** @type {Record<string, number>} */
+			const sizes = { raw: buffer.length }
+			for (const format of formats) {
+				if (format === 'gzip') {
+					const gz = zlib.gzipSync(buffer, { level: 9 })
+					await fs.writeFile(full + '.gz', gz)
+					sizes.gzip = gz.length
+				} else if (format === 'br') {
+					const br = zlib.brotliCompressSync(buffer)
+					await fs.writeFile(full + '.br', br)
+					sizes.br = br.length
+				}
+			}
+			stats.compressed.push({ path: '/' + toPosixPath(rel), ...sizes })
+		}
+	}
+	/**
+	 * Prints per-page timings, per-asset sizes and the Top 10 outputs (#4).
+	 * @param {any} stats
+	 * @param {BuildOptions} opts
+	 */
+	#printReport(stats, opts) {
+		if (opts.quiet) {
+			return
+		}
+		/** @type {string[]} */
+		const lines = [`Wunphile build report (${stats.durationMs}ms)`]
+		lines.push(
+			`  pages: ${stats.pages.length} (${stats.skipped} cached), assets: ${stats.assets.length}, behavior modules: ${stats.modules.length}`,
+		)
+		for (const page of stats.pages) {
+			lines.push(
+				`  page  ${page.path}: ${page.ms}ms, ${formatBytes(page.bytes)}${page.skipped ? ' (cached)' : ''}`,
+			)
+		}
+		for (const asset of stats.assets) {
+			let compressed = null
+			for (const candidate of stats.compressed) {
+				if (candidate.path === asset.finalUrl) {
+					compressed = candidate
+					break
+				}
+			}
+			const extra = compressed
+				? `${compressed.gzip != null ? `, gzip ${formatBytes(compressed.gzip)}` : ''}${compressed.br != null ? `, br ${formatBytes(compressed.br)}` : ''}`
+				: ''
+			lines.push(
+				`  asset ${asset.finalUrl}: raw ${formatBytes(asset.rawSize)}${extra}`,
+			)
+		}
+		/** @type {{ path: string, bytes: number }[]} */
+		const largest = []
+		for (const page of stats.pages) {
+			largest.push({ path: String(page.path), bytes: Number(page.bytes) })
+		}
+		for (const asset of stats.assets) {
+			largest.push({
+				path: String(asset.finalUrl),
+				bytes: Number(asset.size),
+			})
+		}
+		largest.sort((a, b) => b.bytes - a.bytes)
+		largest.length = Math.min(largest.length, 10)
+		lines.push('  Top 10 largest outputs:')
+		for (const item of largest) {
+			lines.push(`    ${formatBytes(item.bytes).padStart(9)}  ${item.path}`)
+		}
+		console.log(lines.join('\n'))
 	}
 	/**
 	 * Builds the site only.
-	 * This method will clear the output directory before building.
 	 *
-	 * The order in which paths are processed is as follows:
-	 *  1. Static directories
-	 *  2. Static files
-	 *  3. Pages
-	 *  4. Sitemap (if enabled)
+	 * Order: clear output -> prepare assets -> expand dynamic routes ->
+	 * write assets -> render pages concurrently -> write generated files ->
+	 * precompress -> report.
 	 *
+	 * @param {BuildOptions} [options] `{ precompress, incremental, stats, concurrency, quiet }`
 	 * @returns {Promise<void>}
 	 */
-	async build() {
+	async build(options = {}) {
 		if (!isMainThread) {
 			console.warn(
 				'The build() method was manually called in a hot reload thread. This is not supported, so the hot reload thread will exit.',
 			)
 			process.exit(0)
 		}
-		if ((await statOrNull(this.#outputPath)) === null) {
-			await fs.mkdir(this.#outputPath, { recursive: true })
+		const opts = { ...this.#buildOptions, ...options }
+		const startTime = Date.now()
+		/** @type {any} */
+		const stats = {
+			startedAt: new Date(startTime).toISOString(),
+			durationMs: 0,
+			pages: [],
+			assets: [],
+			compressed: [],
+			modules: [],
+			skipped: 0,
+			totalBytes: 0,
+			largestModule: 0,
+			timings: {},
+		}
+		this.#buildCache = opts.incremental ? await this.#loadBuildCache() : null
+		if (!opts.incremental) {
+			await this.#clearOutput()
 		} else {
-			/** @type {Promise<void>[]} */
-			const proms = []
-			for (const file of await fs.readdir(this.#outputPath)) {
-				proms.push(
-					fs.rm(this.toOutputPath(file), {
-						recursive: true,
-						force: true,
-					}),
-				)
-			}
-			await Promise.all(proms)
+			await fs.mkdir(this.#outputPath, { recursive: true })
 		}
-		// Static dirs first.
-		for (const [dest, src] of this.#staticDirMappings) {
-			await copyRecursive(
-				this.toProjectPath(src),
-				this.toOutputPath(dest),
+		await this.#prepareAssets()
+		await this.#expandDynamicPages()
+		await this.#clientManager.waitForModules()
+		await this.#writeAssets()
+		const assetCountBefore = this.#staticFileMappings.size
+		/** @type {Record<string, string>} */
+		const nextCache = {}
+		const rendered = new Set()
+		// #22: bounded-concurrency page rendering. New pages registered while
+		// rendering (behavior modules, OG images) are picked up in later rounds.
+		while (true) {
+			const batch = [...this.#pageMapping.entries()].filter(
+				([path]) => !rendered.has(path),
+			)
+			if (batch.length === 0) {
+				break
+			}
+			await mapConcurrent(
+				batch,
+				opts.concurrency ?? 8,
+				async ([dest, component]) => {
+					rendered.add(dest)
+					const started = Date.now()
+					let content = await this.#renderPage(
+						dest,
+						component,
+						this.#makeContext(dest, {}, null, null),
+					)
+					if (this.#minifyHtml && isHtmlPath(dest)) {
+						content = this.#minifyHtmlString(content)
+					}
+					const hash = this.#pageHash(dest, component)
+					nextCache[dest] = hash
+					const cached =
+						opts.incremental &&
+						this.#buildCache?.pages?.[dest] === hash &&
+						(await statOrNull(this.toOutputPath(dest))) !== null
+					if (!cached) {
+						await this.#writePage(dest, content)
+					} else {
+						stats.skipped++
+					}
+					const ms = Date.now() - started
+					stats.pages.push({
+						path: dest,
+						ms,
+						bytes: Buffer.byteLength(content),
+						skipped: Boolean(cached),
+					})
+					stats.timings[dest] = ms
+				},
 			)
 		}
-		// Static files next.
-		for (const [dest, src] of this.#staticFileMappings) {
-			const outPath = this.toOutputPath(dest)
-			const outDir = pathUtil.dirname(outPath)
-			await fs.mkdir(outDir, { recursive: true })
-			await fs.copyFile(this.toProjectPath(src), outPath)
+		// Modules imported by components register static files *during* render.
+		if (this.#staticFileMappings.size !== assetCountBefore) {
+			await this.#prepareAssets()
+			await this.#writeAssets()
 		}
-		// Pages last.
-		for (const [dest, component] of this.#pageMapping) {
-			const dir = pathUtil.dirname(pathUtil.join(this.#outputPath, dest))
-			if ((await statOrNull(dir)) === null) {
-				await fs.mkdir(dir, { recursive: true })
+		stats.assets = [...this.#assets.values()].map((asset) => ({
+			path: asset.url,
+			finalUrl: asset.finalUrl,
+			rawSize: asset.rawSize,
+			size: asset.size,
+			hashed: asset.hashed,
+		}))
+		await this.#writeGeneratedFiles(opts, stats)
+		if (opts.precompress?.length) {
+			await this.#precompress(opts.precompress, stats)
+		}
+		if (opts.incremental) {
+			await this.#saveBuildCache(nextCache)
+		}
+		stats.durationMs = Date.now() - startTime
+		this.#lastStats = stats
+		// #38: build-stats.json contains the final (post-compression) numbers.
+		if (opts.stats) {
+			await this.#writePage(
+				'/build-stats.json',
+				JSON.stringify(stats, null, 2) + '\n',
+			)
+			this.#generatedPaths.add('/build-stats.json')
+		}
+		// #25: onBuildEnd hook
+		for (const plugin of this.#plugins) {
+			if (typeof plugin.onBuildEnd === 'function') {
+				await plugin.onBuildEnd({
+					pages: stats.pages,
+					assets: stats.assets,
+					manifest: stats.manifest,
+					stats,
+				})
 			}
-			let content = await this.#renderToHtmlAsync(component())
-			// NEW FEATURE: Apply HTML minification if enabled.
-			if (this.#minifyHtml) {
-				content = this.#minifyHtmlString(content)
+		}
+		// #4: build report
+		this.#printReport(stats, opts)
+	}
+	/* ==================================================================
+	 * Development server (#13, #14, #15, #16, #17, #33, #40)
+	 * ================================================================ */
+	/**
+	 * Pushes a named SSE event to every connected dev client (#15).
+	 * @param {string} event
+	 * @param {any} data
+	 */
+	#broadcastDev(event, data) {
+		const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+		for (const res of this.#sseClients) {
+			try {
+				res.write(payload)
+			} catch {
+				this.#sseClients.delete(res)
 			}
-			await fs.writeFile(
-				pathUtil.join(this.#outputPath, dest),
-				content,
+		}
+	}
+	/**
+	 * Builds the injected dev client: SSE-first with long-polling fallback,
+	 * a red error overlay, and accessibility warnings (#15/#33).
+	 * @param {boolean} hotReloadEnabled
+	 * @param {boolean} injectEnabled
+	 * @returns {string}
+	 */
+	#devTrailer(hotReloadEnabled, injectEnabled) {
+		if (!injectEnabled) {
+			return ''
+		}
+		const initialError = JSON.stringify(this.#devError ?? null)
+		const warnings = JSON.stringify(this.#devWarnings)
+		const endpoint = JSON.stringify(DEV_ENDPOINT_PREFIX)
+		const hotReload = hotReloadEnabled ? 'true' : 'false'
+		return `
+<!-- Injected by Wunphile for development mode hot reloading -->
+<div id="__wf_overlay" style="display:none;position:fixed;z-index:2147483647;top:0;left:0;right:0;padding:12px 16px;font:13px/1.5 monospace;color:#fff;background:#b91c1c;white-space:pre-wrap;max-height:50vh;overflow:auto"></div>
+<script type="module"${this.#nonceAttr()}>
+(() => {
+	const overlay = document.getElementById('__wf_overlay');
+	const show = (message) => { overlay.textContent = String(message); overlay.style.display = 'block'; };
+	const hide = () => { overlay.style.display = 'none'; overlay.textContent = ''; };
+	const initialError = ${initialError};
+	if (initialError) show(initialError); else hide();
+	for (const warning of ${warnings}) console.warn('[wunphile a11y]', warning);
+	const endpoint = ${endpoint};
+	const hotReload = ${hotReload};
+	function startPolling() {
+		if (window.__wunphile_hotreload_poll) return;
+		window.__wunphile_hotreload_poll = true;
+		(async () => {
+			while (true) {
+				const abort = new AbortController();
+				const timer = setTimeout(() => abort.abort(), 1000);
+				try {
+					const res = await fetch(endpoint, { signal: abort.signal });
+					const rlTime = parseInt(res.headers.get('X-Wunphile-Reload')) || Number.MAX_SAFE_INTEGER;
+					if (rlTime <= ${this.#lastReload}) await res.text();
+					clearTimeout(timer);
+					window.location.reload();
+					return;
+				} catch (err) {
+					clearTimeout(timer);
+					if (!(err instanceof DOMException && err.name === 'AbortError')) {
+						await new Promise((resolve) => setTimeout(resolve, 1000));
+					}
+				}
+			}
+		})();
+	}
+	if (!hotReload) {
+		// Hot reloading is disabled, but the error overlay and a11y warnings
+		// are still injected in development mode.
+	} else if (typeof EventSource !== 'undefined') {
+		const es = new EventSource(endpoint);
+		let opened = false;
+		es.onopen = () => { opened = true; hide(); };
+		es.addEventListener('reload', () => window.location.reload());
+		es.addEventListener('wferror', (ev) => {
+			try { show(JSON.parse(ev.data).message); } catch {}
+		});
+		es.addEventListener('wfwarn', (ev) => {
+			try { for (const w of JSON.parse(ev.data).warnings) console.warn('[wunphile a11y]', w); } catch {}
+		});
+		es.onerror = () => { if (!opened) { es.close(); startPolling(); } };
+	} else {
+		startPolling();
+	}
+})();
+</script>`
+	}
+	/**
+	 * Creates a portable file watcher (#16).
+	 * Prefers chokidar when installed, falls back to `fs.watch({recursive})`,
+	 * and finally to per-directory watchers when recursion is unsupported.
+	 * @param {(filename: string) => void} onChange
+	 * @returns {void}
+	 */
+	#createWatcher(onChange) {
+		const root = this.#rootPath
+		if (
+			process.platform === 'linux' &&
+			parseInt(process.versions.node, 10) < 20
+		) {
+			console.warn(
+				'[wunphile] recursive fs.watch is not supported on Linux before Node 20; install chokidar for reliable watching.',
 			)
 		}
-		// NEW FEATURE: Generate sitemap.xml if enabled.
-		if (this.#sitemapBaseUrl != null && this.#sitemapPath != null) {
-			const sitemapContent = this.#buildSitemap()
-			const sitemapOutPath = this.toOutputPath(this.#sitemapPath)
-			const sitemapDir = pathUtil.dirname(sitemapOutPath)
-			if ((await statOrNull(sitemapDir)) === null) {
-				await fs.mkdir(sitemapDir, { recursive: true })
+		const ignored = [this.#outputPath, pathUtil.join(root, '.git'), pathUtil.join(root, CACHE_DIR)]
+		const chokidar = resolveOptional('chokidar', root)
+		if (chokidar?.watch) {
+			const watcher = chokidar.watch(root, {
+				ignoreInitial: true,
+				ignored,
+			})
+			watcher.on(
+				'all',
+				(/** @type {any} */ _event, /** @type {any} */ filename) =>
+					onChange(String(filename ?? '')),
+			)
+			this.#watchers.push({ close: () => watcher.close() })
+			console.log('[wunphile] using chokidar for file watching')
+			return
+		}
+		try {
+			const watcher = fsSync.watch(
+				root,
+				{ recursive: true, persistent: true },
+				(_eventType, filename) => {
+					if (filename == null) {
+						console.warn(
+							'[wunphile] fs.watch reported a null filename (platform limitation); install chokidar for reliable watching.',
+						)
+					}
+					onChange(filename == null ? '' : String(filename))
+				},
+			)
+			this.#watchers.push({ close: () => watcher.close() })
+		} catch (err) {
+			console.warn(
+				'[wunphile] recursive fs.watch is unavailable; falling back to per-directory watchers.',
+				err,
+			)
+			/** @param {string} dir */
+			const watchDir = (dir) => {
+				if (ignored.some((path) => dir === path || dir.startsWith(path + pathUtil.sep))) {
+					return
+				}
+				try {
+					const watcher = fsSync.watch(dir, {}, (_eventType, filename) =>
+						onChange(pathUtil.join(dir, String(filename ?? ''))),
+					)
+					this.#watchers.push({ close: () => watcher.close() })
+				} catch {}
+				try {
+					for (const entry of fsSync.readdirSync(dir, { withFileTypes: true })) {
+						if (entry.isDirectory()) {
+							watchDir(pathUtil.join(dir, entry.name))
+						}
+					}
+				} catch {}
 			}
-			await fs.writeFile(sitemapOutPath, sitemapContent)
-			// FIX #8: Log the number of URLs actually written, not the number
-			// of registered pages (which also counts client mounts, redirects
-			// and the not-found page). Every entry is emitted as one <url>.
-			const writtenEntries = (sitemapContent.match(/<url>/g) ?? []).length
-			console.log(
-				`Generated sitemap at ${this.#sitemapPath} with ${writtenEntries} URLs`,
+			watchDir(root)
+		}
+	}
+	/**
+	 * Returns true when a changed path should be ignored.
+	 * @param {string} filename
+	 * @returns {boolean}
+	 */
+	#ignoreChange(filename) {
+		if (filename === '') {
+			return false
+		}
+		const full = pathUtil.resolve(this.#rootPath, filename)
+		return (
+			full === this.#outputPath ||
+			full.startsWith(this.#outputPath + pathUtil.sep) ||
+			full.includes(pathUtil.sep + '.git' + pathUtil.sep) ||
+			full.includes(pathUtil.sep + CACHE_DIR + pathUtil.sep)
+		)
+	}
+	/**
+	 * Re-runs the main module in a worker and installs its output (#15).
+	 * @param {any} hrEmitter
+	 * @returns {Promise<void>}
+	 */
+	async #reloadFromWorker(hrEmitter) {
+		if (!isWorkerApiSupported) {
+			return
+		}
+		const worker = new Worker(this.#mainModulePath, {
+			workerData: {
+				rootPath: this.#rootPath,
+				outputPath: this.#outputPath,
+				notFoundPath: this.#notFoundPath,
+				config: this.#config ?? {},
+			},
+		})
+		let gotError = false
+		/** @type {string | null} */
+		let errorMessage = null
+		/** @type {Map<string, any>} */
+		const pageMapping = new Map()
+		const preRendered = new Map()
+		/** @type {Map<string, string>} */
+		const staticDirMapping = new Map()
+		/** @type {Map<string, string>} */
+		const staticFileMapping = new Map()
+		/** @type {Map<string, any>} */
+		const staticDirOptions = new Map()
+		/** @type {Map<string, any>} */
+		const staticFileOptions = new Map()
+		/** @type {Map<string, any>} */
+		const redirects = new Map()
+		/** @type {Map<string, any>} */
+		const collections = new Map()
+		worker.on(
+			'message',
+			/** @type {(msg: any) => void} */ ((msg) => {
+				switch (msg.type) {
+					case 'pageRaw':
+						preRendered.set(msg.path, msg.content)
+						pageMapping.set(msg.path, () => html(msg.content))
+						break
+					case 'staticDir':
+						staticDirMapping.set(msg.path, msg.dir)
+						staticDirOptions.set(msg.path, msg.options ?? {})
+						break
+					case 'staticFile':
+						staticFileMapping.set(msg.path, msg.file)
+						staticFileOptions.set(msg.path, msg.options ?? {})
+						break
+					case 'redirect':
+						redirects.set(msg.path, { to: msg.to, status: msg.status })
+						break
+					case 'collection':
+						collections.set(msg.name, msg.entries ?? [])
+						break
+					case 'pageError':
+						gotError = true
+						errorMessage = String(msg.error)
+						console.error(
+							`Error while rendering page "${msg.path}":\n${msg.error}`,
+						)
+						break
+				}
+			}),
+		)
+		worker.on('error', (err) => {
+			gotError = true
+			errorMessage = err.stack || String(err)
+			console.error('Error while reloading:', errorMessage)
+		})
+		worker.on('messageerror', (err) => {
+			gotError = true
+			errorMessage = String(err)
+			console.error('Worker message error:', err)
+		})
+		await new Promise((resolve) => worker.on('exit', resolve))
+		if (!gotError) {
+			this.#pageMapping = pageMapping
+			this.#preRenderedContent = preRendered
+			this.#staticDirMappings = staticDirMapping
+			this.#staticFileMappings = staticFileMapping
+			this.#staticDirOptions = staticDirOptions
+			this.#staticFileOptions = staticFileOptions
+			this.#redirects = redirects
+			this.#collections = collections
+			this.#devError = null
+			await this.#prepareAssets()
+			console.log('Reloaded successfully.')
+		} else {
+			this.#devError = errorMessage ?? 'Unknown reload error'
+			console.error(
+				'Reload failed - keeping previous state. Fix the error and save again to retry.',
 			)
 		}
+		// Always emit reload so browsers recheck, even on failure.
+		hrEmitter?.emit('reload')
+	}
+	/**
+	 * Watches the project and hot-reloads the dev server.
+	 * @param {any} hrEmitter
+	 */
+	#watchHotReload(hrEmitter) {
+		console.log(
+			`Development mode hot reloading enabled. Watching "${this.#rootPath}" for changes.`,
+		)
+		let pending = false
+		this.#createWatcher(async (filename) => {
+			if (this.#ignoreChange(filename) || pending) {
+				return
+			}
+			pending = true
+			try {
+				await new Promise((resolve) => setTimeout(resolve, 50))
+				await this.#reloadFromWorker(hrEmitter)
+			} catch (err) {
+				this.#devError = err instanceof Error ? err.stack || err.message : String(err)
+				console.error('Error while reloading:', err)
+				hrEmitter?.emit('reload')
+			} finally {
+				pending = false
+			}
+		})
+	}
+	/**
+	 * Watches the project and rebuilds without starting an HTTP server (#28).
+	 * @param {BuildOptions} buildOpts
+	 */
+	#watchBuild(buildOpts) {
+		console.log(
+			`Build watch mode enabled. Watching "${this.#rootPath}" for changes.`,
+		)
+		let pending = false
+		this.#createWatcher(async (filename) => {
+			if (this.#ignoreChange(filename) || pending) {
+				return
+			}
+			pending = true
+			try {
+				await new Promise((resolve) => setTimeout(resolve, 50))
+				console.log('[wunphile] change detected, rebuilding...')
+				await this.build({ ...buildOpts, quiet: true })
+			} catch (err) {
+				console.error('[wunphile] rebuild failed:', err)
+			} finally {
+				pending = false
+			}
+		})
 	}
 	/**
 	 * Serves the site on a local HTTP server.
 	 *
+	 * Adds ETag/304, Range, gzip/br compression, SSE hot reload with a long
+	 * polling fallback, an error overlay, plugin `onDevRequest`, accessibility
+	 * warnings and a `(path, lastReload)` render cache.
+	 *
 	 * @param {number} port The port to listen on
-	 * @param {string} [host='127.0.0.1'] The host to listen on (optional, defaults to `127.0.0.1`)
-	 * @param {EventEmitter<{ reload: [] }>|null} [hotReloadEventEmitter=null] The event emitter to emit hot reload events on
-	 * @returns {Promise<void>}
+	 * @param {string} [host='127.0.0.1'] The host to listen on
+	 * @param {EventEmitter<{ reload: [] }>|null} [hotReloadEventEmitter=null]
+	 * @param {{ signal?: AbortSignal }} [options]
+	 * @returns {Promise<DevHandle>} A handle with `server` and `close()` (#40)
 	 */
-	async serve(port, host = '127.0.0.1', hotReloadEventEmitter = null) {
+	async serve(
+		port,
+		host = '127.0.0.1',
+		hotReloadEventEmitter = null,
+		options = {},
+	) {
 		if (!isMainThread) {
 			console.warn(
 				'The serve() method was manually called in a hot reload thread. This is not supported, so the hot reload thread will exit.',
 			)
 			process.exit(0)
 		}
-		if (process.env[DEV_NO_INJECT_ENV_VAR] === '1') {
+		const injectEnabled = readEnv(DEV_NO_INJECT_ENV_VAR) !== '1'
+		if (!injectEnabled) {
 			hotReloadEventEmitter = null
 		}
 		const http = await import('node:http')
-		const extToMime = await this.#loadExtToMime()
-		if (extToMime === null) {
-			console.error(
-				'Could not resolve a MIME database to use development mode.',
-			)
-			console.error(
-				`Please add the mime-db package to your NPM project or place a copy of mime-db's JSON database next to Wunphile as mime-db.json.`,
-			)
-			process.exit(1)
-		}
+		const extToMime = (await this.#loadExtToMime()) ?? new Map()
 		/**
 		 * @param {string} path
 		 * @returns {string}
 		 */
 		const pathToMime = (path) => {
-			const def = 'application/octet-stream'
 			const dotIdx = path.lastIndexOf('.')
 			if (dotIdx === -1) {
-				return def
+				return 'application/octet-stream'
 			}
-			return extToMime.get(path.substring(dotIdx + 1)) ?? def
+			const ext = path.substring(dotIdx + 1).toLowerCase()
+			return extToMime.get(ext) ?? mimeForExt(ext)
 		}
-		// IMPROVEMENT (issue #9): Cache the trailer string once (per lastReload value)
-		// instead of regenerating it for every HTML response.
-		/** @type {Map<number, string>} */
-		const trailerCache = new Map()
-		const mkTrailer = () => {
-			if (hotReloadEventEmitter === null) {
-				return ''
-			}
-			const cached = trailerCache.get(this.#lastReload)
-			if (cached !== undefined) {
-				return cached
-			}
-			const trailer = `
-<!-- Injected by Wunphile for development mode hot reloading -->
-<script type="module">
-if (!window.__wunphile_hotreload) {
-	window.__wunphile_hotreload = true
-	let abort
-	let abortTimeout = 0
-	while (true) {
-		abort?.abort()
-		clearTimeout(abort)
-		abort = new AbortController()
-		abortTimeout = setTimeout(() => abort.abort(), 1_000)
-		try {
-			const res = await fetch('/__hotreload', { signal: abort.signal })
-			const rlTime = parseInt(res.headers.get('X-Wunphile-Reload')) || Number.MAX_SAFE_INTEGER
-			if (rlTime <= ${this.#lastReload}) {
-				await res.text()
-			}
-			window.location.reload()
-		} catch (err) {
-			if (!(err instanceof DOMException && err.name === 'AbortError')) {
-				console.error('hot reload check failed, sleeping')
-				await new Promise(res => setTimeout(res, 1_000))
-			}
-		}
-	}
-}
-</script>`
-			trailerCache.set(this.#lastReload, trailer)
-			if (trailerCache.size > 10) {
-				// Bounded cache; oldest entries are least-recently-used.
-				const firstKey = trailerCache.keys().next().value
-				if (firstKey !== undefined) {
-					trailerCache.delete(firstKey)
-				}
-			}
-			return trailer
-		}
-		/** @type {import('node:http').ServerResponse[]} */
+		await this.#prepareAssets()
+		await this.#expandDynamicPages()
+		await this.#clientManager.waitForModules()
+		const devEmitter = hotReloadEventEmitter
+		/** @type {any[]} */
 		const waitResponses = []
-		if (hotReloadEventEmitter != null) {
-			hotReloadEventEmitter.on('reload', () => {
+		if (devEmitter !== null) {
+			devEmitter.on('reload', () => {
 				this.#lastReload = Date.now()
+				this.#clientManager.newGeneration()
+				this.#devRenderCache.clear()
 				for (const res of waitResponses) {
-					res.write('ok')
-					res.end()
+					try {
+						res.write('ok')
+						res.end()
+					} catch {}
 				}
 				waitResponses.length = 0
+				this.#broadcastDev('reload', { t: this.#lastReload })
+				if (this.#devError) {
+					this.#broadcastDev('wferror', { message: this.#devError })
+				}
 			})
 		}
 		const server = http.createServer(async (req, res) => {
-			const url = new URL(
-				/** @type {string} */ (req.url),
-				'http://localhost',
-			)
-			const basePath = url.pathname
-			if (hotReloadEventEmitter !== null && basePath === '/__hotreload') {
-				res.writeHead(200, {
-					'Content-Type': 'text/html',
-					'X-Wunphile-Reload': String(this.#lastReload),
-					'Content-Length': 5,
-				})
-				res.write('...')
-				res.req.on('close', () => {
-					for (let i = 0; i < waitResponses.length; i++) {
-						if (waitResponses[i] === res) {
-							waitResponses.splice(i, 1)
-							break
+			try {
+				const url = new URL(
+					/** @type {string} */ (req.url),
+					'http://localhost',
+				)
+				let basePath = url.pathname
+				if (
+					this.#base !== '' &&
+					(basePath === this.#base || basePath.startsWith(this.#base + '/'))
+				) {
+					basePath = basePath.slice(this.#base.length) || '/'
+				}
+				// #25: plugin hook, may fully handle the request.
+				for (const plugin of this.#plugins) {
+					if (typeof plugin.onDevRequest === 'function') {
+						const handled = await plugin.onDevRequest(req, res)
+						if (handled === true || res.writableEnded) {
+							return
 						}
 					}
-				})
-				waitResponses.push(res)
-				return
-			}
-			/** @type {string[]} */
-			let paths
-			if (basePath.endsWith('/')) {
-				paths = [basePath + 'index.html']
-			} else {
-				paths = [basePath, basePath + '/index.html']
-			}
-			/**
-			 * Matches a path against a static prefix, ensuring the path either
-			 * equals the prefix or continues with a `/` boundary.
-			 *
-			 * BUG 6 FIX: Previously `path.startsWith(staticPath)` would let
-			 * `/assetsEvil/x.js` incorrectly match the `/assets` prefix.
-			 *
-			 * @param {string} path The request path
-			 * @param {string} staticPath The configured static mount prefix
-			 * @returns {boolean}
-			 */
-			const matchesStaticPrefix = (path, staticPath) => {
-				if (path === staticPath) {
-					return true
 				}
-				const prefixWithSlash = staticPath.endsWith('/')
-					? staticPath
-					: staticPath + '/'
-				return path.startsWith(prefixWithSlash)
-			}
-			/**
-			 * @param {string} path
-			 * @param {number} [status=200]
-			 * @returns {Promise<boolean>}
-			 */
-			const tryPath = async (path, status = 200) => {
-				const mime = pathToMime(path)
-				const pageMapping = this.#pageMapping.get(path)
-				if (pageMapping !== undefined) {
-					res.writeHead(status, { 'Content-Type': mime })
-					res.write(await this.#renderToHtmlAsync(pageMapping()))
-					if (mime === 'text/html') {
-						console.log(`Serving ${path}`)
-						res.write(mkTrailer())
+				// #20: client-side behavior error reports.
+				if (basePath === '/_wfclient/error' && req.method === 'POST') {
+					let body = ''
+					for await (const chunk of req) {
+						body += chunk
 					}
+					console.error('[wunphile] client behavior error:', body)
+					res.writeHead(204)
 					res.end()
-					return true
-				}
-				// Try static directories.
-				for (const [staticPath, dirPath] of this.#staticDirMappings) {
-					// BUG 6 FIX: Use boundary-aware matching.
-					if (matchesStaticPrefix(path, staticPath)) {
-						const fsPath = this.toProjectPath(
-							pathUtil.join(
-								dirPath,
-								path.substring(staticPath.length),
-							),
-						)
-						if ((await statOrNull(fsPath)) !== null) {
-							await using file = await fs.open(fsPath, 'r')
-							console.log(`Serving ${path}`)
-							res.writeHead(200, { 'Content-Type': mime })
-							try {
-								await pipeline(file.createReadStream(), res)
-							} catch {}
-							res.end()
-							return true
-						}
-					}
-				}
-				// Try static files.
-				for (const [staticPath, filePath] of this.#staticFileMappings) {
-					if (path === staticPath) {
-						const fsPath = this.toProjectPath(filePath)
-						if ((await statOrNull(fsPath)) !== null) {
-							// FIX #11: Use pipeline() exactly like the static
-							// directory branch. pipe() already ends the
-							// response, so the extra res.end() inside the
-							// promise could raise ERR_STREAM_WRITE_AFTER_END.
-							await using file = await fs.open(fsPath, 'r')
-							res.writeHead(200, { 'Content-Type': mime })
-							try {
-								await pipeline(file.createReadStream(), res)
-							} catch {}
-							res.end()
-							return true
-						}
-					}
-				}
-				return false
-			}
-			for (const path of paths) {
-				if (await tryPath(path)) {
 					return
 				}
-			}
-			if (!(await tryPath(this.#notFoundPath, 404))) {
-				res.writeHead(404, { 'Content-Type': 'text/plain' })
-				res.write('Not Found')
-				res.end()
+				// #15: SSE (preferred) and long polling (fallback).
+				if (devEmitter !== null && basePath === DEV_ENDPOINT_PREFIX) {
+					const accept = String(req.headers.accept ?? '')
+					if (
+						accept.includes('text/event-stream') ||
+						url.searchParams.has('sse')
+					) {
+						res.writeHead(200, {
+							'Content-Type': 'text/event-stream',
+							'Cache-Control': 'no-cache, no-transform',
+							Connection: 'keep-alive',
+							'X-Accel-Buffering': 'no',
+						})
+						res.write('retry: 2000\n\n')
+						if (this.#devError) {
+							res.write(
+								`event: wferror\ndata: ${JSON.stringify({ message: this.#devError })}\n\n`,
+							)
+						}
+						this.#sseClients.add(res)
+						req.on('close', () => this.#sseClients.delete(res))
+						return
+					}
+					res.writeHead(200, {
+						'Content-Type': 'text/html',
+						'X-Wunphile-Reload': String(this.#lastReload),
+						'Content-Length': 5,
+					})
+					res.write('...')
+					req.on('close', () => {
+						const idx = waitResponses.indexOf(res)
+						if (idx !== -1) {
+							waitResponses.splice(idx, 1)
+						}
+					})
+					waitResponses.push(res)
+					return
+				}
+				if (basePath === '/manifest.json') {
+					await sendContent(res, req, {
+						body: JSON.stringify(this.manifest(), null, 2) + '\n',
+						mime: mimeForExt('json'),
+					})
+					return
+				}
+				// #12: real HTTP redirects in development mode.
+				const redirect = this.#redirects.get(basePath)
+				if (redirect != null) {
+					res.writeHead(redirect.status, {
+						Location: redirect.to,
+						'Cache-Control': 'no-store',
+					})
+					res.end()
+					return
+				}
+				if (this.#ogImages.has(basePath)) {
+					await sendContent(res, req, {
+						body: /** @type {Buffer} */ (this.#ogImages.get(basePath)),
+						mime: basePath.endsWith('.png')
+							? mimeForExt('png')
+							: mimeForExt('svg'),
+					})
+					return
+				}
+				// #1/#2: assets (including fingerprinted URLs and CSS rewrites).
+				const asset = this.#assets.get(basePath)
+				if (asset != null) {
+					/** @type {Record<string, string>} */
+					const headers = {
+						...(asset.headers ?? {}),
+						...(asset.hashed
+							? { 'Cache-Control': 'public, max-age=31536000, immutable' }
+							: {}),
+					}
+					if (asset.content != null) {
+						await sendContent(res, req, {
+							body: asset.content,
+							mime: asset.mime,
+							headers,
+						})
+						return
+					}
+					if (asset.stat?.isFile()) {
+						await sendContent(res, req, {
+							filePath: asset.sourcePath,
+							stat: asset.stat,
+							mime: asset.mime,
+							headers,
+						})
+						return
+					}
+				}
+				/** @type {string[]} */
+				let paths
+				if (basePath.endsWith('/')) {
+					paths = [basePath + 'index.html']
+				} else {
+					paths = [basePath, basePath + '/index.html']
+				}
+				/**
+				 * Boundary-aware static prefix matching (BUG 6 FIX).
+				 * @param {string} path
+				 * @param {string} staticPath
+				 * @returns {boolean}
+				 */
+				const matchesStaticPrefix = (path, staticPath) => {
+					if (path === staticPath) {
+						return true
+					}
+					const prefixWithSlash = staticPath.endsWith('/')
+						? staticPath
+						: staticPath + '/'
+					return path.startsWith(prefixWithSlash)
+				}
+				/**
+				 * @param {string} path
+				 * @param {number} [status=200]
+				 * @returns {Promise<boolean>}
+				 */
+				const tryPath = async (path, status = 200) => {
+					const mime = pathToMime(path)
+					const component = this.#pageMapping.get(path)
+					if (component !== undefined) {
+						// #17: cache rendered pages by (path, lastReload).
+						const cacheKey = `${path}|${this.#lastReload}`
+						const cached = this.#devRenderCache.get(path)
+						let htmlStr = cached?.key === cacheKey ? cached.html : null
+						if (htmlStr == null) {
+							htmlStr =
+								this.#preRenderedContent.get(path) ??
+								(await this.#renderPage(
+									path,
+									component,
+									this.#makeContext(path, {}, null, null),
+								))
+							this.#devRenderCache.set(path, { key: cacheKey, html: htmlStr })
+						}
+						// #33: development-mode accessibility checks.
+						if (mime.startsWith('text/html')) {
+							const warnings = checkAccessibility(htmlStr)
+							if (warnings.length > 0) {
+								this.#devWarnings = warnings.map((w) => `${path}: ${w}`)
+								this.#broadcastDev('wfwarn', {
+									path,
+									warnings: this.#devWarnings,
+								})
+							}
+						}
+						const body =
+							htmlStr +
+							(mime.startsWith('text/html')
+								? this.#devTrailer(devEmitter !== null, injectEnabled)
+								: '')
+						await sendContent(res, req, {
+							body,
+							mime,
+							status,
+							etag: `W/"${this.#lastReload}-${contentHash(body)}"`,
+						})
+						return true
+					}
+					// #35: decode and validate static paths before opening files.
+					for (const [staticPath, dirPath] of this.#staticDirMappings) {
+						if (!matchesStaticPrefix(path, staticPath)) {
+							continue
+						}
+						let relative
+						try {
+							relative = decodeURIComponent(
+								path.substring(staticPath.length),
+							).replace(/^\/+/, '')
+						} catch {
+							return false
+						}
+						if (relative.includes('\u0000')) {
+							return false
+						}
+						const baseDir = pathUtil.resolve(this.toProjectPath(dirPath))
+						const fsPath = pathUtil.resolve(baseDir, relative)
+						const boundary = pathUtil.relative(baseDir, fsPath)
+						if (
+							boundary === '..' ||
+							boundary.startsWith('..' + pathUtil.sep) ||
+							pathUtil.isAbsolute(boundary)
+						) {
+							console.warn(
+								`[wunphile] blocked path traversal attempt: ${path}`,
+							)
+							return false
+						}
+						const stat = await statOrNull(fsPath)
+						if (stat?.isFile()) {
+							await sendContent(res, req, {
+								filePath: fsPath,
+								stat,
+								mime,
+							})
+							return true
+						}
+					}
+					for (const [staticPath, filePath] of this.#staticFileMappings) {
+						if (path !== staticPath) {
+							continue
+						}
+						const fsPath = this.toProjectPath(filePath)
+						const stat = await statOrNull(fsPath)
+						if (stat?.isFile()) {
+							await sendContent(res, req, {
+								filePath: fsPath,
+								stat,
+								mime,
+							})
+							return true
+						}
+					}
+					return false
+				}
+				for (const path of paths) {
+					if (await tryPath(path)) {
+						return
+					}
+				}
+				if (!(await tryPath(this.#notFoundPath, 404))) {
+					res.writeHead(404, { 'Content-Type': 'text/plain' })
+					res.write('Not Found')
+					res.end()
+				}
+			} catch (err) {
+				console.error('[wunphile] dev server error:', err)
+				if (!res.headersSent) {
+					res.writeHead(500, { 'Content-Type': 'text/plain' })
+				}
+				res.end('Internal Server Error')
 			}
 		})
-		server.listen(port, host, () => {
-			console.log(`Serving on http://${host}:${port}`)
+		await new Promise((resolve) => {
+			server.listen(port, host, () => resolve(undefined))
 		})
+		console.log(`Serving on http://${host}:${port}`)
+		/** @type {DevHandle} */
+		const handle = {
+			server,
+			close: () =>
+				new Promise((resolve) => {
+					for (const client of this.#sseClients) {
+						try {
+							client.end()
+						} catch {}
+					}
+					this.#sseClients.clear()
+					for (const watcher of this.#watchers) {
+						try {
+							watcher.close()
+						} catch {}
+					}
+					this.#watchers.length = 0
+					server.close(() => resolve())
+				}),
+		}
+		if (options.signal) {
+			options.signal.addEventListener(
+				'abort',
+				() => {
+					void handle.close()
+				},
+				{ once: true },
+			)
+		}
+		return handle
+	}
+	/**
+	 * Serves the built `dist` directory as a pure static server, without
+	 * requiring any `#pageMapping` (#27). Supports ETag/304, Range and
+	 * precompressed `.br`/`.gz` artifacts.
+	 *
+	 * @param {number} [port=3000]
+	 * @param {string} [host='127.0.0.1']
+	 * @param {{ signal?: AbortSignal }} [options]
+	 * @returns {Promise<DevHandle>}
+	 */
+	async preview(port = 3000, host = '127.0.0.1', options = {}) {
+		const http = await import('node:http')
+		const extToMime = (await this.#loadExtToMime()) ?? new Map()
+		/**
+		 * @param {string} path
+		 * @returns {string}
+		 */
+		const pathToMime = (path) => {
+			const dotIdx = path.lastIndexOf('.')
+			if (dotIdx === -1) {
+				return 'application/octet-stream'
+			}
+			const ext = path.substring(dotIdx + 1).toLowerCase()
+			return extToMime.get(ext) ?? mimeForExt(ext)
+		}
+		const server = http.createServer(async (req, res) => {
+			try {
+				const url = new URL(
+					/** @type {string} */ (req.url),
+					'http://localhost',
+				)
+				let pathname = url.pathname
+				if (
+					this.#base !== '' &&
+					(pathname === this.#base || pathname.startsWith(this.#base + '/'))
+				) {
+					pathname = pathname.slice(this.#base.length) || '/'
+				}
+				const candidates = pathname.endsWith('/')
+					? [pathname + 'index.html']
+					: [pathname, pathname + '/index.html']
+				for (const candidate of candidates) {
+					let relative
+					try {
+						relative = decodeURIComponent(candidate).replace(/^\/+/, '')
+					} catch {
+						continue
+					}
+					const fsPath = pathUtil.resolve(this.#outputPath, relative)
+					const boundary = pathUtil.relative(this.#outputPath, fsPath)
+					if (
+						boundary === '..' ||
+						boundary.startsWith('..' + pathUtil.sep) ||
+						pathUtil.isAbsolute(boundary)
+					) {
+						continue
+					}
+					const stat = await statOrNull(fsPath)
+					if (!stat?.isFile()) {
+						continue
+					}
+					const mime = pathToMime(candidate)
+					// Prefer precompressed artifacts when available (#3).
+					const accept = String(req.headers['accept-encoding'] ?? '')
+					for (const [ext, encoding] of [
+						['.br', 'br'],
+						['.gz', 'gzip'],
+					]) {
+						if (!accept.includes(encoding)) {
+							continue
+						}
+						const preStat = await statOrNull(fsPath + ext)
+						if (preStat?.isFile()) {
+							const body = await fs.readFile(fsPath + ext)
+							res.writeHead(200, {
+								'Content-Type': mime,
+								'Content-Encoding': encoding,
+								'Content-Length': String(body.length),
+								Vary: 'Accept-Encoding',
+								'Accept-Ranges': 'bytes',
+							})
+							res.end(req.method === 'HEAD' ? undefined : body)
+							return
+						}
+					}
+					await sendContent(res, req, {
+						filePath: fsPath,
+						stat,
+						mime,
+					})
+					return
+				}
+				const notFound = pathUtil.resolve(
+					this.#outputPath,
+					this.#notFoundPath.replace(/^\/+/, ''),
+				)
+				const stat = await statOrNull(notFound)
+				if (stat?.isFile()) {
+					await sendContent(res, req, {
+						filePath: notFound,
+						stat,
+						mime: mimeForExt('html'),
+						status: 404,
+					})
+				} else {
+					res.writeHead(404, { 'Content-Type': 'text/plain' })
+					res.end('Not Found')
+				}
+			} catch (err) {
+				console.error('[wunphile] preview server error:', err)
+				if (!res.headersSent) {
+					res.writeHead(500, { 'Content-Type': 'text/plain' })
+				}
+				res.end('Internal Server Error')
+			}
+		})
+		await new Promise((resolve) => {
+			server.listen(port, host, () => resolve(undefined))
+		})
+		console.log(
+			`Previewing ${this.#outputPath} on http://${host}:${port}`,
+		)
+		/** @type {DevHandle} */
+		const handle = {
+			server,
+			close: () =>
+				new Promise((resolve) => server.close(() => resolve())),
+		}
+		if (options.signal) {
+			options.signal.addEventListener(
+				'abort',
+				() => {
+					void handle.close()
+				},
+				{ once: true },
+			)
+		}
+		return handle
 	}
 	/**
 	 * Runs the site generator CLI.
 	 *
-	 * @returns {Promise<void>}
+	 * @param {string[] | string} [argv] Arguments (defaults to `process.argv`)
+	 * @returns {Promise<any>}
 	 */
-	async cli() {
+	async cli(argv = process.argv.slice(2, process.argv.length)) {
 		if (!isMainThread) {
 			return
 		}
-		const args = process.argv.slice(2, process.argv.length)
+		const args = Array.isArray(argv)
+			? argv
+			: String(argv).trim().split(/\s+/).filter(Boolean)
 		if (args.includes('--help') || args.includes('-h')) {
 			console.log(
-				`Usage: ${process.argv[1]} [options]
-Options:
-  --help, -h
-    Show this help message.
-  --build, -b
-    Build the site (default action).
-  --dev, -d
-  	Start a development server.
-  	Watches the project root directory for changes and hot reloads the site.
-  	The project will be running in development mode.
-Environment variables:
-  SSG_ROOT_PATH
-    The root path of the project.
-    Defaults to the directory of the program main module.
-  SSG_OUTPUT_PATH
-    The output path of the generated site.
-    Defaults to "dist" in the project root path.
-  SSG_NOT_FOUND_PATH
-    The path to use for the "not found" page.
-    Defaults to "/404.html".
-  SSG_DEV_PORT
-  	The port to listen on for the development server.
-    Defaults to 3000.
-  SSG_DEV_HOST
-    The host to listen on for the development server.
-    Defaults to "127.0.0.1".
-  SSG_DEV_NO_HOT_RELOAD
-    If set to 1, disables hot reloading in development mode.
-  SSG_DEV_NO_INJECT
-  	If set to 1, disables injecting hot reload scripts into pages in development mode.
-`.trim(),
+				`Usage: ${process.argv[1]} [command] [options]
+Commands / options:
+  (none), --build, -b   Build the site (default action).
+  --dev, -d             Start the development server with hot reloading.
+  --preview             Serve the built output directory as a static server.
+  --watch               Rebuild on changes without starting an HTTP server.
+  --stats               Write dist/build-stats.json.
+  --incremental         Use .wunphile/cache.json to skip unchanged pages.
+  --precompress         Write .gz and .br variants of text assets.
+  --quiet               Suppress the build report.
+  --port <n>            Development/preview port (default 3000).
+  --host <host>         Development/preview host (default 127.0.0.1).
+  --help, -h            Show this help message.
+Environment variables (WUNPHILE_* aliases take precedence):
+  SSG_ROOT_PATH / WUNPHILE_ROOT_PATH
+  SSG_OUTPUT_PATH / WUNPHILE_OUTPUT_PATH
+  SSG_NOT_FOUND_PATH / WUNPHILE_NOT_FOUND_PATH
+  SSG_DEV_PORT / WUNPHILE_DEV_PORT
+  SSG_DEV_HOST / WUNPHILE_DEV_HOST
+  SSG_DEV_NO_HOT_RELOAD / WUNPHILE_DEV_NO_HOT_RELOAD
+  SSG_DEV_NO_INJECT / WUNPHILE_DEV_NO_INJECT`.trim(),
 			)
 			return
 		}
 		await this.#clientManager.waitForModules()
-		if (args.includes('--dev') || args.includes('-d')) {
-			const httpPort = parseInt(process.env[DEV_PORT_ENV_VAR] || '3000')
-			const httpHost = process.env[DEV_HOST_ENV_VAR] || '127.0.0.1'
-			if (isNaN(httpPort)) {
-				console.error(
-					`Invalid port specified in ${DEV_PORT_ENV_VAR} environment variable: ${process.env[DEV_PORT_ENV_VAR]}`,
-				)
-				process.exit(1)
+		/**
+		 * @param {string} name
+		 * @returns {string | null}
+		 */
+		const argValue = (name) => {
+			const inline = args.find((arg) => arg.startsWith(name + '='))
+			if (inline) {
+				return inline.slice(name.length + 1)
 			}
-			/** @type {EventEmitter<{ reload: [] }>|null} */
+			const idx = args.indexOf(name)
+			return idx === -1 ? null : (args[idx + 1] ?? null)
+		}
+		const httpPort = parseInt(
+			readEnv(DEV_PORT_ENV_VAR) || argValue('--port') || '3000',
+			10,
+		)
+		const httpHost =
+			readEnv(DEV_HOST_ENV_VAR) || argValue('--host') || '127.0.0.1'
+		if (isNaN(httpPort)) {
+			console.error(
+				`Invalid port specified in ${DEV_PORT_ENV_VAR} environment variable: ${readEnv(DEV_PORT_ENV_VAR)}`,
+			)
+			process.exit(1)
+		}
+		/** @type {BuildOptions} */
+		const buildOpts = { ...this.#buildOptions }
+		if (args.includes('--stats')) {
+			buildOpts.stats = true
+		}
+		if (args.includes('--incremental')) {
+			buildOpts.incremental = true
+		}
+		if (args.includes('--quiet')) {
+			buildOpts.quiet = true
+		}
+		if (args.includes('--precompress')) {
+			buildOpts.precompress = ['gzip', 'br']
+		}
+		if (args.includes('--preview')) {
+			return this.preview(httpPort, httpHost)
+		}
+		if (args.includes('--dev') || args.includes('-d')) {
+			/** @type {EventEmitter<{ reload: [] }> | null} */
 			let hrEmitter = null
 			if (
 				isWorkerApiSupported &&
-				process.env[DEV_NO_HOT_RELOAD_ENV_VAR] !== '1'
+				readEnv(DEV_NO_HOT_RELOAD_ENV_VAR) !== '1'
 			) {
 				hrEmitter = new EventEmitter()
-				let hasPendingReload = false
-				console.log(
-					`Development mode hot reloading enabled. Watching "${this.#rootPath}" for changes.`,
-				)
-				const oldFs = await import('node:fs')
-				oldFs.watch(
-					this.#rootPath,
-					// FIX #7: fs.watch has no `ignored` option (that is a chokidar
-					// API); it was silently ignored, so output writes caused
-					// hot-reload loops. Filter in the callback instead.
-					{ recursive: true, persistent: true },
-					async (_eventType, filename) => {
-						// FIX #7: A null filename means the platform did not report
-						// one, so conservatively allow the reload in that case.
-						if (filename != null) {
-							const full = pathUtil.resolve(
-								this.#rootPath,
-								String(filename),
-							)
-							if (full.startsWith(this.#outputPath)) {
-								return
-							}
-						}
-						if (hasPendingReload) {
-							return
-						}
-						hasPendingReload = true
-						try {
-							// Wait a little while to let writes finish.
-							await new Promise((resolve) =>
-								setTimeout(resolve, 50),
-							)
-							const worker = new Worker(this.#mainModulePath, {
-								workerData: {
-									rootPath: this.#rootPath,
-									outputPath: this.#outputPath,
-									notFoundPath: this.#notFoundPath,
-								},
-							})
-							let gotError = false
-							/** @type {Error | null} */
-							let lastError = null
-							/** @type {Map<string, Component<void, void>>} */
-							const pageMapping = new Map()
-							/** @type {Map<string, string>} */
-							const staticDirMapping = new Map()
-							/** @type {Map<string, string>} */
-							const staticFileMapping = new Map()
-							worker.on(
-								'message',
-								/** @type {(msg: any) => void} */ (
-									(msg) => {
-										switch (msg.type) {
-											case 'pageRaw':
-												pageMapping.set(msg.path, () =>
-													html(msg.content),
-												)
-												break
-											case 'staticDir':
-												staticDirMapping.set(
-													msg.path,
-													msg.dir,
-												)
-												break
-											case 'staticFile':
-												staticFileMapping.set(
-													msg.path,
-													msg.file,
-												)
-												break
-											// FIX #12: Merge worker-side render
-											// failures into the existing gotError
-											// path, so the old mapping is kept and
-											// reload is still emitted only once.
-											case 'pageError':
-												gotError = true
-												lastError = new Error(String(msg.error))
-												console.error(
-													`Error while rendering page "${msg.path}":\n${msg.error}`,
-												)
-												break
-											}
-									}
-								),
-							)
-							worker.on('error', (err) => {
-								gotError = true
-								lastError = err
-								// IMPROVEMENT: Print the full stack so users can
-								// actually locate the source of the reload failure.
-								console.error('Error while reloading:', err.stack || err)
-							})
-							// NEW: Capture unhandled rejections inside the worker
-							// (e.g., from top-level await failures in user code).
-							worker.on('messageerror', (err) => {
-								gotError = true
-								lastError = err
-								console.error('Worker message error:', err.stack || err)
-							})
-							await new Promise((res) => worker.on('exit', res))
-							if (!gotError) {
-								this.#pageMapping = pageMapping
-								this.#staticDirMappings = staticDirMapping
-								this.#staticFileMappings = staticFileMapping
-								console.log('Reloaded successfully.')
-							} else {
-								// NEW: Display a clearer user-facing hint.
-								console.error(
-									'Reload failed - keeping previous state. Fix the error and save again to retry.',
-								)
-							}
-						} finally {
-							hasPendingReload = false
-						}
-						// Always emit reload so browsers recheck, even on failure.
-						// @ts-expect-error hrEmitter is assigned by now
-						hrEmitter.emit('reload')
-					},
-				)
+				this.#watchHotReload(hrEmitter)
 			}
-			await this.serve(httpPort, httpHost, hrEmitter)
+			return this.serve(httpPort, httpHost, hrEmitter)
+		}
+		if (args.includes('--watch')) {
+			await this.build(buildOpts)
+			this.#watchBuild(buildOpts)
 			return
 		}
 		const now = Date.now()
-		await this.build()
+		await this.build(buildOpts)
 		console.log(`Built site in ${Date.now() - now}ms`)
 	}
 }
-/** @typedef {0 | 1 | 2 | 3} RenderFragmentEnum Render fragment types. */
 /**
- * Render fragment types.
+ * Render fragment types. `HEAD` is collected during rendering and injected
+ * into `<head>` instead of being emitted inline (#7).
  * @type {Record<string, RenderFragmentEnum>}
  */
 export const RenderFragmentType = {
@@ -1811,6 +5693,7 @@ export const RenderFragmentType = {
 	HTML: 1,
 	BEHAVIOR_MODULE: 2,
 	BEHAVIOR_MODULE_LOADER: 3,
+	HEAD: 4,
 }
 // REFACTOR: Public compatibility alias; must be the exact same class object.
 /**
@@ -1853,15 +5736,19 @@ export class RenderFragment {
 	value
 	/** @type {Promise<any> | null} */
 	behaviorModulePromise
+	/** @type {Record<string, any> | null} Structured payload for HEAD/behavior fragments. */
+	meta
 	/**
 	 * @param {RenderFragmentEnum} type
 	 * @param {string} value
 	 * @param {Promise<any> | null} [behaviorModulePromise]
+	 * @param {Record<string, any> | null} [meta]
 	 */
-	constructor(type, value, behaviorModulePromise = null) {
+	constructor(type, value, behaviorModulePromise = null, meta = null) {
 		this.type = type
 		this.value = value
 		this.behaviorModulePromise = behaviorModulePromise
+		this.meta = meta
 	}
 	// FIX #1: Restore the missing instance method. #renderToHtmlAsync() and
 	// renderToHtml() both call fragment.toHtml(), so without it every page
@@ -1878,8 +5765,9 @@ export class RenderFragment {
 				return this.value
 			case RenderFragmentType.BEHAVIOR_MODULE:
 			case RenderFragmentType.BEHAVIOR_MODULE_LOADER:
-				// Behavior modules are not rendered to HTML.
-				// The loader is injected separately by #renderToHtmlAsync.
+			case RenderFragmentType.HEAD:
+				// Behavior modules and Head fragments are not rendered inline.
+				// They are collected separately by #renderToHtmlAsync.
 				return ''
 			default:
 				throw new Error(
@@ -1931,6 +5819,7 @@ export const BehaviorLoader = () => {
 /**
  * @typedef BehaviorModuleProps
  * @property {Promise<{ default: BehaviorModule }>} module
+ * @property {LoadStrategy} [load] Hydration strategy (#20): eager/visible/idle/interaction.
  */
 /**
  * Wraps a component in a behavior.
@@ -1944,9 +5833,46 @@ export const BehaviorComponent = (props, children) => {
 			RenderFragmentType.BEHAVIOR_MODULE,
 			'',
 			props.module,
+			props.load ? { load: props.load } : null,
 		),
 		...children,
 	]
+}
+/**
+ * Declares head metadata for a page (#7/#30).
+ *
+ * All `Head` fragments in a page (and in its layout) are merged and injected
+ * into `<head>` during rendering. `title`, `description`, `canonical`,
+ * `meta`, `og`, `links`, `jsonLd` and `image` are supported. With a sitemap
+ * base URL, canonical and hreflang tags are added automatically.
+ *
+ * @param {Record<string, any>} props
+ * @returns {RenderFragments}
+ */
+export function Head(props) {
+	return [
+		new RenderFragment(
+			RenderFragmentType.HEAD,
+			JSON.stringify(props ?? {}),
+			null,
+			props ?? {},
+		),
+	]
+}
+/**
+ * Identity helper providing typed autocomplete for the single config object
+ * (#26). All existing chained methods remain valid.
+ *
+ * @example
+ * const wunphile = new Wunphile(import.meta.url, defineConfig({
+ *   outDir: 'dist', baseUrl: 'https://example.com', plugins: [myPlugin],
+ * }))
+ *
+ * @param {WunphileConfig} config
+ * @returns {WunphileConfig}
+ */
+export function defineConfig(config) {
+	return config
 }
 /**
  * Renders the provided render fragments to HTML.
@@ -2017,7 +5943,13 @@ export async function copyRecursive(source, target) {
 }
 const htmlEntityRegex = /[&<>"']/
 /**
- * Sanitizes the provided HTML by escaping HTML entities
+ * Escapes HTML entities (`& < > " '`) in a string.
+ *
+ * IMPORTANT (#37): this is *entity escaping*, not an HTML sanitizer. It makes
+ * untrusted text safe to interpolate into HTML, but it does NOT validate URLs,
+ * strip tags or make pasted rich text safe. Use {@link escapeAttribute} for
+ * attribute values and {@link stripHtml} for plain-text summaries (e.g. RSS).
+ *
  * @param {string} html
  * @returns {string}
  * @since 1.0.0
